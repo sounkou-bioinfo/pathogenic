@@ -1,0 +1,16 @@
+[package]
+name = "pathogenic_variant_finder"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Command-line argument parser for user inputs (genome build, input file)
+clap = { version = "4.5", features = ["derive"] }
+# HTTP client for downloading ClinVar files
+reqwest = { version = "0.11", features = ["blocking"] }
+# CSV writer for outputting results
+csv = "1.3"
+# Rayon for parallel iteration (multi-threaded processing)
+rayon = "1.10"
+# For .gz
+flate2 = "1.1.0"
