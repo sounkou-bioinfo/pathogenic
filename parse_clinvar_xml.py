@@ -9,7 +9,7 @@ columns = [
     'GRCh37_Chromosome', 'GRCh37_PositionVCF', 'GRCh37_ReferenceAlleleVCF', 'GRCh37_AlternateAlleleVCF', 'GRCh37_Start', 'GRCh37_Stop',
     'GRCh38_Chromosome', 'GRCh38_PositionVCF', 'GRCh38_ReferenceAlleleVCF', 'GRCh38_AlternateAlleleVCF', 'GRCh38_Start', 'GRCh38_Stop',
     'MolecularConsequence', 'FunctionalConsequence',
-    'ModeOfInheritance', 'PreferredValues', 'Citations', 'Comments', 'AssertionMethods', 'FamilyData',
+    'ModeOfInheritance', 'PreferredValues', 'Citations', 'Comments', 'FamilyData',
     'RecordStatus', 'ClinicalSignificance', 'ReviewStatus', 'Description', 'DateLastEvaluated'
 ]
 
@@ -79,7 +79,6 @@ def extract_variant_data(clinvar_set):
     preferred_values = [elem.text for elem in measure.findall('Name/ElementValue[@Type="Preferred"]') if elem.text]
     citations = [cit.findtext('ID') for cit in clinvar_set.findall('.//Citation') if cit.find('ID') is not None]
     comments = [com.text for com in clinvar_set.findall('.//Comment') if com.text]
-    assertion_methods = [am.text for am in clinvar_set.findall('.//AssertionMethod') if am.text]
     family_data = [fd.get('NumFamilies', '') for fd in clinvar_set.findall('.//FamilyData') if fd.get('NumFamilies')]
 
     # Construct the row dictionary
@@ -108,7 +107,6 @@ def extract_variant_data(clinvar_set):
         'PreferredValues': ';'.join(preferred_values),
         'Citations': ';'.join(citations),
         'Comments': ';'.join(comments),
-        'AssertionMethods': ';'.join(assertion_methods),
         'FamilyData': ';'.join(family_data),
         'RecordStatus': record_status,
         'ClinicalSignificance': clinical_significance,
