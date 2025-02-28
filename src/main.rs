@@ -1,35 +1,35 @@
-// src/main.rs
-
+use clap::Parser;
+use csv;
+use flate2::read::MultiGzDecoder;
+use indicatif::{ProgressBar, ProgressStyle};
+use rayon::prelude::*;
+use reqwest::blocking;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, copy, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::thread;
 
-use clap::Parser;
-use flate2::read::MultiGzDecoder;
-use rayon::prelude::*;
-use reqwest::blocking;
+use num_cpus;
 
 /// Command-line arguments
 #[derive(Parser)]
 #[command(
     name = "pathogenic",
-    about = "Identify pathogenic variants from a VCF using ClinVar data"
+    about = "Identify pathogenic variants from a VCF using official ClinVar (GRCh37 or GRCh38)"
 )]
 struct Args {
-    /// Genome build: "GRCh37" or "GRCh38"
+    /// Genome build: must be "GRCh37" (hg19) or "GRCh38" (hg38)
     #[arg(short, long)]
     build: String,
 
-    /// Path to the input VCF (uncompressed) file
+    /// Path to the input VCF (uncompressed)
     #[arg(short, long, value_name = "FILE")]
     input: PathBuf,
 }
 
-/// A small error type to unify download failures
+/// Custom error type for downloads
 #[derive(Debug)]
 enum DownloadError {
     Io(std::io::Error),
@@ -44,7 +44,6 @@ impl fmt::Display for DownloadError {
     }
 }
 impl Error for DownloadError {}
-
 impl From<std::io::Error> for DownloadError {
     fn from(e: std::io::Error) -> Self {
         DownloadError::Io(e)
@@ -56,522 +55,561 @@ impl From<reqwest::Error> for DownloadError {
     }
 }
 
-/// Download a file from `url` to `out_path`.
+/// Download a remote file with a progress bar, if not already present locally.
 fn download_file(url: &str, out_path: &Path) -> Result<(), DownloadError> {
-    let response = blocking::get(url)?;
+    println!("  -> Downloading from {url} ...");
+    let mut response = blocking::get(url)?;
+
+    // If the server provides a Content-Length, we can show progress
+    let total_size = response
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|ct_len| ct_len.to_str().ok())
+        .and_then(|ct_len_str| ct_len_str.parse().ok())
+        .unwrap_or(0);
+
+    let pb = ProgressBar::new(total_size);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})",
+            )
+            .unwrap()
+            .progress_chars("=>-"),
+    );
+
     let mut file = File::create(out_path)?;
-    copy(&mut response.take(u64::MAX), &mut file)?;
+    let mut downloaded: u64 = 0;
+    let mut buffer = [0u8; 8192];
+    loop {
+        let bytes_read = response.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        file.write_all(&buffer[..bytes_read])?;
+        downloaded += bytes_read as u64;
+        pb.set_position(downloaded);
+    }
+    pb.finish_with_message("Download complete");
+
     Ok(())
 }
 
-/// A struct to hold ClinVar data for a variant
+/// A specialized type for validated ClinVar lines
+/// storing only the data we care about: chr, pos, ref, alt, clnsig, gene, allele_id
 #[derive(Debug, Clone)]
-struct ClinVarInfo {
+struct ClinVarRecord {
+    chr: String,
+    pos: u32,
+    ref_allele: String,
+    alt_allele: String,
     clnsig: String,
     gene: Option<String>,
     allele_id: Option<i32>,
 }
 
-/// Read the ClinVar VCF (which is .vcf.gz) line by line, parse out only the
-/// Pathogenic/Likely_pathogenic variants, store them in a map keyed by (chr, pos, ref, alt).
-fn parse_clinvar_vcf_gz(
-    vcf_gz_path: &Path,
-    input_uses_chr: bool,
-) -> Result<HashMap<(String, u32, String, String), ClinVarInfo>, Box<dyn Error>> {
-    let file = File::open(vcf_gz_path)?;
-    let decoder = MultiGzDecoder::new(file);
-    let reader = BufReader::new(decoder);
+/// Container for final ClinVar variants keyed by (chr, pos, ref, alt)
+type ClinVarMap = HashMap<(String, u32, String, String), ClinVarRecord>;
 
-    let mut clinvar_variants = HashMap::new();
-    let mut clinvar_uses_chr = false; // We'll guess after we see first contig in header
-
-    let mut in_header = true;
-    for line_res in reader.lines() {
-        let line = match line_res {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-        // Skip blank lines
-        if line.trim().is_empty() {
-            continue;
-        }
-        if in_header {
-            if line.starts_with("##") {
-                // still in meta lines
-                continue;
-            } else if line.starts_with("#CHROM") {
-                // header line
-                in_header = false;
-                continue;
-            } else {
-                // unexpected line, possibly #CHROM but missing the label
-                continue;
-            }
-        }
-
-        // Now we parse a data line
-        // Format: CHROM  POS  ID  REF  ALT  QUAL  FILTER  INFO  [FORMAT] [samples...]
-        let mut fields = line.split('\t');
-        let chrom_str = match fields.next() {
-            Some(c) => c.to_string(),
-            None => continue,
-        };
-        let pos_str = match fields.next() {
-            Some(p) => p,
-            None => continue,
-        };
-        // skip ID
-        let _ = fields.next();
-        let ref_str = match fields.next() {
-            Some(r) => r,
-            None => continue,
-        };
-        let alt_str = match fields.next() {
-            Some(a) => a,
-            None => continue,
-        };
-        // skip QUAL, FILTER
-        let _ = fields.next();
-        let _ = fields.next();
-        // read INFO
-        let info_str = match fields.next() {
-            Some(i) => i,
-            None => continue,
-        };
-
-        // Try to parse pos
-        let pos_num = match pos_str.parse::<u32>() {
-            Ok(pn) => pn,
-            Err(_) => continue,
-        };
-
-        // Let's see if we guessed whether ClinVar has 'chr' or not
-        // We'll do it after the first data line
-        if clinvar_uses_chr == false {
-            if chrom_str.starts_with("chr") {
-                clinvar_uses_chr = true;
-            }
-        }
-
-        // We'll unify naming with the input's style:
-        // If input has chr and ClinVar doesn't, we add "chr" if it's not "MT" (or fix for "MT")
-        // If input doesn't have chr and ClinVar does, we remove "chr"
-        // We'll do that in a small function:
-        let mut chr_fixed = chrom_str.clone();
-        if input_uses_chr && !clinvar_uses_chr {
-            if chr_fixed == "MT" {
-                chr_fixed = "chrM".to_string();
-            } else {
-                chr_fixed = format!("chr{}", chr_fixed);
-            }
-        } else if !input_uses_chr && clinvar_uses_chr {
-            if chr_fixed.eq_ignore_ascii_case("chrM") || chr_fixed.eq_ignore_ascii_case("chrMT") {
-                chr_fixed = "MT".to_string();
-            } else if let Some(stripped) = chr_fixed.strip_prefix("chr") {
-                chr_fixed = stripped.to_string();
-            }
-        }
-
-        // Parse multiple ALTs if any
-        let alt_list: Vec<&str> = alt_str.split(',').collect();
-
-        // Parse the INFO field into a map
-        let mut info_map = parse_info_field(info_str);
-
-        // Check CLNSIG
-        let clnsig_opt = info_map.remove("CLNSIG"); // e.g. "Pathogenic|otherstuff"
-        if clnsig_opt.is_none() {
-            continue;
-        }
-        let clnsig_str = clnsig_opt.unwrap();
-        // If not "Pathogenic" or "Likely_pathogenic", skip
-        // Also skip if "Conflicting_interpretations_of_pathogenicity"
-        if !clnsig_str.contains("Pathogenic") {
-            continue;
-        }
-        if clnsig_str.contains("Conflicting_interpretations_of_pathogenicity") {
-            continue;
-        }
-
-        // geneinfo
-        let gene_opt = info_map.remove("GENEINFO").and_then(|val| {
-            // e.g. "BRCA2:675"
-            let part = val.split(':').next().unwrap_or(&val);
-            Some(part.to_string())
-        });
-
-        // allele_id
-        let allele_id_opt = info_map.remove("ALLELEID").and_then(|val| {
-            // we might parse it as i32
-            if let Ok(num) = val.parse::<i32>() {
-                Some(num)
-            } else {
-                None
-            }
-        });
-
-        // For each ALT, create an entry
-        let ref_allele = ref_str.to_string();
-        for alt_item in alt_list {
-            let alt_allele = alt_item.to_string();
-
-            let key = (chr_fixed.clone(), pos_num, ref_allele.clone(), alt_allele);
-            let info_struct = ClinVarInfo {
-                clnsig: clnsig_str.clone(),
-                gene: gene_opt.clone(),
-                allele_id: allele_id_opt,
-            };
-            clinvar_variants.insert(key, info_struct);
-        }
-    }
-
-    Ok(clinvar_variants)
-}
-
-/// Parse the user's local, uncompressed VCF line by line
-/// Return a vector of input variants, each with the alt alleles and whether they
-/// are present in genotype (we do a simplistic approach).
-fn parse_input_vcf(
-    input_vcf_path: &Path,
-    need_chr: bool,
-) -> Result<Vec<InputVariant>, Box<dyn Error>> {
-    let file = File::open(input_vcf_path)?;
-    let reader = BufReader::new(file);
-
-    let mut variants = Vec::new();
-    let mut in_header = true;
-    let mut input_uses_chr = false;
-
-    // We'll determine if input has "chr" from first data line's CHROM
-    // But we also have "need_chr" and "has_chr_clinvar" to unify naming
-    for line_res in reader.lines() {
-        let line = match line_res {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-        if in_header {
-            if line.starts_with("##") {
-                continue;
-            } else if line.starts_with("#CHROM") {
-                in_header = false;
-                continue;
-            } else {
-                // skip other header lines
-                continue;
-            }
-        }
-
-        // parse data line
-        let mut cols = line.split('\t');
-        let chrom_str = match cols.next() {
-            Some(c) => c.to_string(),
-            None => continue,
-        };
-        let pos_str = match cols.next() {
-            Some(c) => c,
-            None => continue,
-        };
-        // skip ID
-        let _ = cols.next();
-        let ref_str = match cols.next() {
-            Some(r) => r,
-            None => continue,
-        };
-        let alt_str = match cols.next() {
-            Some(a) => a,
-            None => continue,
-        };
-        // skip QUAL, FILTER
-        let _ = cols.next();
-        let _ = cols.next();
-        // read INFO
-        let _ = cols.next().unwrap_or("");
-
-        // read FORMAT + genotype if any
-        // or skip if not present
-        let format_and_more: Vec<&str> = cols.collect();
-
-        // detect if input has "chr"
-        if !input_uses_chr {
-            if chrom_str.starts_with("chr") {
-                input_uses_chr = true;
-            }
-        }
-
-        // unify naming
-        let mut chr_fixed = chrom_str.clone();
-        if need_chr && !input_uses_chr {
-            if chr_fixed == "MT" {
-                chr_fixed = "chrM".to_string();
-            } else {
-                chr_fixed = format!("chr{}", chr_fixed);
-            }
-        } else if !need_chr && input_uses_chr {
-            if chr_fixed.eq_ignore_ascii_case("chrM") || chr_fixed.eq_ignore_ascii_case("chrMT") {
-                chr_fixed = "MT".to_string();
-            } else if let Some(stripped) = chr_fixed.strip_prefix("chr") {
-                chr_fixed = stripped.to_string();
-            }
-        }
-
-        let pos_num = match pos_str.parse::<u32>() {
-            Ok(pn) => pn,
-            Err(_) => continue,
-        };
-        let ref_allele = ref_str.to_string();
-
-        let alt_list: Vec<String> = alt_str.split(',').map(|s| s.to_string()).collect();
-
-        // simplistic genotype parse: check if there's a "GT" column
-        // in the format. If not, we'll assume all alt are present.
-        let mut present_flags = HashSet::new();
-        // format_and_more[0] might be FORMAT, subsequent are sample fields
-        if !format_and_more.is_empty() {
-            let format_cols = format_and_more[0].split(':').collect::<Vec<&str>>();
-            // find which index is GT if any
-            let gt_index_opt = format_cols.iter().position(|f| *f == "GT");
-
-            if gt_index_opt.is_some() && format_and_more.len() > 1 {
-                // we have at least one sample
-                let sample_fields = format_and_more[1]; // first sample
-                let sample_items = sample_fields.split(':').collect::<Vec<&str>>();
-                let gt_index = gt_index_opt.unwrap();
-                if gt_index < sample_items.len() {
-                    let gt_val = sample_items[gt_index];
-                    // e.g. "0/1" or "1|1"
-                    // parse out numeric allele indices
-                    let separators = ['/', '|'];
-                    let alleles_gt = gt_val.split(&separators[..]).collect::<Vec<&str>>();
-                    for al_str in alleles_gt {
-                        if let Ok(idx) = al_str.parse::<usize>() {
-                            if idx >= 1 {
-                                // alt allele
-                                present_flags.insert(idx);
-                            }
-                        }
-                    }
-                } else {
-                    // no GT in that sample => assume all alt
-                    for i in 1..=alt_list.len() {
-                        present_flags.insert(i);
-                    }
-                }
-            } else {
-                // no GT field => assume all alt
-                for i in 1..=alt_list.len() {
-                    present_flags.insert(i);
-                }
-            }
-        } else {
-            // no format => assume all alt
-            for i in 1..=alt_list.len() {
-                present_flags.insert(i);
-            }
-        }
-
-        let mut alts_with_pres = Vec::new();
-        for (i, alt_a) in alt_list.into_iter().enumerate() {
-            let alt_idx = i + 1;
-            let is_present = present_flags.contains(&alt_idx);
-            alts_with_pres.push((alt_a, is_present));
-        }
-
-        variants.push(InputVariant {
-            chr: chr_fixed,
-            pos: pos_num,
-            ref_allele,
-            alts: alts_with_pres,
-        });
-    }
-
-    Ok(variants)
-}
-
-/// A struct to represent one input VCF variant record and which alt alleles are present
-#[derive(Debug)]
-struct InputVariant {
-    chr: String,
-    pos: u32,
-    ref_allele: String,
-    alts: Vec<(String, bool)>,
-}
-
-/// A helper function to parse INFO field (semicolon-delimited key=value pairs)
-fn parse_info_field(info: &str) -> HashMap<String, String> {
+/// A helper to parse the semicolon-delimited INFO field
+fn parse_info_field(info_str: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
-    for item in info.split(';') {
+    for item in info_str.split(';') {
         if item.is_empty() {
             continue;
         }
-        // might be KEY=VAL or just KEY
-        let mut eqsplit = item.splitn(2, '=');
-        let key = eqsplit.next().unwrap_or("").to_string();
-        let val = eqsplit.next().unwrap_or("").to_string();
-        // store
+        let mut kv = item.splitn(2, '=');
+        let key = kv.next().unwrap_or("").to_string();
+        let val = kv.next().unwrap_or("").to_string();
         map.insert(key, val);
     }
     map
 }
 
+/// Attempt to parse one line of the ClinVar VCF into zero or more `ClinVarRecord`s.
+/// - Return `None` if line is invalid or not Pathogenic.
+/// - If multiple ALT alleles, return multiple records.
+fn parse_clinvar_line(
+    line: &str,
+    clinvar_has_chr: bool,
+    input_uses_chr: bool,
+) -> Option<Vec<ClinVarRecord>> {
+    // Skip comments
+    if line.starts_with('#') || line.trim().is_empty() {
+        return None;
+    }
+
+    // Format: CHROM  POS  ID  REF  ALT  QUAL  FILTER  INFO ...
+    let mut fields = line.split('\t');
+    let chrom = fields.next()?.to_string();
+    let pos_str = fields.next()?;
+    // skip ID
+    let _ = fields.next();
+    let ref_allele = fields.next()?;
+    let alt_allele = fields.next()?;
+    // skip QUAL, FILTER
+    let _ = fields.next();
+    let _ = fields.next();
+    let info_str = fields.next()?;
+    let pos_num: u32 = pos_str.parse().ok()?;
+
+    // unify naming
+    let mut chr_fixed = chrom;
+    if input_uses_chr && !clinvar_has_chr {
+        // add "chr"
+        if chr_fixed == "MT" {
+            chr_fixed = "chrM".to_string();
+        } else {
+            chr_fixed = format!("chr{}", chr_fixed);
+        }
+    } else if !input_uses_chr && clinvar_has_chr {
+        // remove "chr"
+        if chr_fixed.eq_ignore_ascii_case("chrM") || chr_fixed.eq_ignore_ascii_case("chrMT") {
+            chr_fixed = "MT".to_string();
+        } else if let Some(stripped) = chr_fixed.strip_prefix("chr") {
+            chr_fixed = stripped.to_string();
+        }
+    }
+
+    let alt_list: Vec<&str> = alt_allele.split(',').collect();
+    let info_map = parse_info_field(info_str);
+
+    let clnsig_opt = info_map.get("CLNSIG");
+    if clnsig_opt.is_none() {
+        return None;
+    }
+    let clnsig_str = clnsig_opt.unwrap();
+    // Must contain "Pathogenic" or "Likely_pathogenic"
+    if !clnsig_str.contains("Pathogenic") {
+        return None;
+    }
+    // Skip if "Conflicting_interpretations_of_pathogenicity"
+    if clnsig_str.contains("Conflicting_interpretations_of_pathogenicity") {
+        return None;
+    }
+
+    let gene_opt = info_map
+        .get("GENEINFO")
+        .map(|g| g.split(':').next().unwrap_or(g).to_string());
+    let allele_id_opt = info_map.get("ALLELEID").and_then(|a| a.parse::<i32>().ok());
+
+    // Return one ClinVarRecord for each ALT
+    let mut recs = Vec::with_capacity(alt_list.len());
+    for alt_a in alt_list {
+        recs.push(ClinVarRecord {
+            chr: chr_fixed.clone(),
+            pos: pos_num,
+            ref_allele: ref_allele.to_string(),
+            alt_allele: alt_a.to_string(),
+            clnsig: clnsig_str.to_string(),
+            gene: gene_opt.clone(),
+            allele_id: allele_id_opt,
+        });
+    }
+    Some(recs)
+}
+
+/// Parse the entire ClinVar .vcf.gz in parallel, building a `ClinVarMap`.
+fn parse_clinvar_vcf_gz(
+    path_gz: &Path,
+    input_uses_chr: bool,
+) -> Result<ClinVarMap, Box<dyn Error>> {
+    println!("\n[STEP] Parsing ClinVar .vcf.gz: {}", path_gz.display());
+
+    // We can't just read the entire .gz into memory easily. Instead, let's read line by line
+    // but in big chunk buffers. Then we can parallelize in a chunked manner if we want
+    // a "type-driven" approach. For simplicity, let's read line by line in a single pass,
+    // then do parallel "map" on lines if we store them in memory.
+
+    // If the file is extremely large, it might be more memory than you'd like, but ClinVar
+    // is ~300-500MB compressed, ~3GB uncompressed. We'll do it carefully.
+
+    // 1) Read + decompress line by line into memory
+    // 2) Detect if ClinVar has "chr" from the first data line
+    // 3) Parallel parse each line with parse_clinvar_line()
+    // 4) Merge into final map
+
+    let f = File::open(path_gz)?;
+    let mut decoder = MultiGzDecoder::new(f);
+
+    // We'll store lines in a buffer. Because of memory constraints, if you prefer,
+    // you can parse line-by-line in a single thread or in a streaming fashion.
+    // For demonstration, we'll do the "load into memory" approach:
+
+    let mut unzipped_contents = String::new();
+    decoder.read_to_string(&mut unzipped_contents)?;
+
+    println!(
+        "  -> Decompressed size: {} bytes. Using {} CPU cores.",
+        unzipped_contents.len(),
+        num_cpus::get()
+    );
+
+    let lines: Vec<&str> = unzipped_contents.lines().collect();
+    let total = lines.len() as u64;
+
+    // Does ClinVar have "chr"? We'll check the first data line
+    let mut clinvar_has_chr = false;
+    for &line in &lines {
+        if line.starts_with('#') {
+            continue;
+        }
+        let chrom_part = line.split('\t').next().unwrap_or("");
+        if chrom_part.starts_with("chr") {
+            clinvar_has_chr = true;
+        }
+        break;
+    }
+
+    let pb = ProgressBar::new(total);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} ({eta})")
+            .unwrap()
+            .progress_chars("=>-"),
+    );
+
+    // Parallel parse
+    let chunk_maps: Vec<ClinVarMap> = lines
+        .par_iter()
+        .map(|&line| {
+            pb.inc(1);
+
+            match parse_clinvar_line(line, clinvar_has_chr, input_uses_chr) {
+                None => HashMap::new(),
+                Some(records) => {
+                    let mut local_map = HashMap::with_capacity(records.len());
+                    for r in records {
+                        let key = (r.chr.clone(), r.pos, r.ref_allele.clone(), r.alt_allele.clone());
+                        local_map.insert(key, r);
+                    }
+                    local_map
+                }
+            }
+        })
+        .collect();
+
+    pb.finish_with_message("ClinVar parse complete.");
+
+    // Merge chunk maps
+    let mut final_map = HashMap::new();
+    for cm in chunk_maps {
+        final_map.extend(cm);
+    }
+
+    println!("  -> Final ClinVar map size: {}", final_map.len());
+    Ok(final_map)
+}
+
+//-------------------------------------
+// Parse the user input (uncompressed)
+//-------------------------------------
+
+/// Simple struct for user input variants
+#[derive(Debug)]
+struct InputVariant {
+    chr: String,
+    pos: u32,
+    ref_allele: String,
+    alts: Vec<(String, bool)>, // (alt_allele, is_present_in_genotype)
+}
+
+/// Parse user input (uncompressed) VCF line into zero/one `InputVariant`.
+fn parse_input_line(line: &str, user_has_chr: bool, need_chr: bool) -> Option<InputVariant> {
+    if line.starts_with('#') || line.trim().is_empty() {
+        return None;
+    }
+
+    // CHROM POS ID REF ALT QUAL FILTER INFO [FORMAT, SAMPLE...]
+    let mut fields = line.split('\t');
+    let chrom = fields.next()?.to_string();
+    let pos_str = fields.next()?;
+    // skip ID
+    let _ = fields.next();
+    let ref_allele = fields.next()?;
+    let alt_allele = fields.next()?;
+    // skip QUAL, FILTER
+    let _ = fields.next();
+    let _ = fields.next();
+    // skip INFO
+    let _ = fields.next();
+
+    let mut rest_cols = Vec::new();
+    for c in fields {
+        rest_cols.push(c);
+    }
+
+    let pos_num: u32 = pos_str.parse().ok()?;
+    // unify naming
+    let mut chr_fixed = chrom;
+    if need_chr && !user_has_chr {
+        if chr_fixed == "MT" {
+            chr_fixed = "chrM".to_string();
+        } else {
+            chr_fixed = format!("chr{}", chr_fixed);
+        }
+    } else if !need_chr && user_has_chr {
+        if chr_fixed.eq_ignore_ascii_case("chrM") || chr_fixed.eq_ignore_ascii_case("chrMT") {
+            chr_fixed = "MT".to_string();
+        } else if let Some(stripped) = chr_fixed.strip_prefix("chr") {
+            chr_fixed = stripped.to_string();
+        }
+    }
+
+    let alt_list: Vec<String> = alt_allele.split(',').map(|s| s.to_string()).collect();
+    let mut present_flags = HashSet::new();
+
+    // If we have at least one col, the first is FORMAT
+    // if we have second col, that's the first sample
+    if !rest_cols.is_empty() {
+        let format_str = rest_cols[0];
+        let format_items: Vec<&str> = format_str.split(':').collect();
+        let gt_index_opt = format_items.iter().position(|&f| f == "GT");
+
+        if gt_index_opt.is_some() && rest_cols.len() > 1 {
+            let sample_str = rest_cols[1];
+            let sample_items: Vec<&str> = sample_str.split(':').collect();
+            let gt_index = gt_index_opt.unwrap();
+            if gt_index < sample_items.len() {
+                let gt_val = sample_items[gt_index];
+                let split_gt: Vec<&str> = gt_val.split(&['/', '|'][..]).collect();
+                for g in split_gt {
+                    if let Ok(idx) = g.parse::<usize>() {
+                        if idx >= 1 {
+                            present_flags.insert(idx);
+                        }
+                    }
+                }
+            } else {
+                // no GT => assume all alt
+                for i in 1..=alt_list.len() {
+                    present_flags.insert(i);
+                }
+            }
+        } else {
+            // no GT => assume all alt
+            for i in 1..=alt_list.len() {
+                present_flags.insert(i);
+            }
+        }
+    } else {
+        // no format => assume all alt
+        for i in 1..=alt_list.len() {
+            present_flags.insert(i);
+        }
+    }
+
+    let mut alts = Vec::with_capacity(alt_list.len());
+    for (i, alt_a) in alt_list.into_iter().enumerate() {
+        let alt_idx = i + 1;
+        let is_present = present_flags.contains(&alt_idx);
+        alts.push((alt_a, is_present));
+    }
+
+    Some(InputVariant {
+        chr: chr_fixed,
+        pos: pos_num,
+        ref_allele: ref_allele.to_string(),
+        alts,
+    })
+}
+
+/// Parse the entire user input VCF (uncompressed).
+fn parse_input_vcf(path: &Path, need_chr: bool) -> Result<Vec<InputVariant>, Box<dyn Error>> {
+    println!("\n[STEP] Parsing user input VCF (uncompressed): {}", path.display());
+
+    // We'll do a quick check: if path ends in ".gz", we reject
+    if let Some(ext) = path.extension() {
+        if ext == "gz" {
+            return Err(format!("User input VCF cannot be compressed: {}", path.display()).into());
+        }
+    }
+
+    // Read entire file into memory for parallel processing
+    let mut file = File::open(path)?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+
+    println!(
+        "  -> Loaded user input VCF ({} bytes). Using {} CPU cores.",
+        contents.len(),
+        num_cpus::get()
+    );
+
+    let lines: Vec<&str> = contents.lines().collect();
+    let total = lines.len() as u64;
+
+    // Detect if user input has "chr" from the first data line
+    let mut user_has_chr = false;
+    for &l in &lines {
+        if l.starts_with('#') || l.trim().is_empty() {
+            continue;
+        }
+        let chrom_part = l.split('\t').next().unwrap_or("");
+        if chrom_part.starts_with("chr") {
+            user_has_chr = true;
+        }
+        break;
+    }
+
+    let pb = ProgressBar::new(total);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} ({eta})")
+            .unwrap()
+            .progress_chars("=>-"),
+    );
+
+    let chunk_variants: Vec<Vec<InputVariant>> = lines
+        .par_iter()
+        .map(|&line| {
+            pb.inc(1);
+            match parse_input_line(line, user_has_chr, need_chr) {
+                None => vec![],
+                Some(iv) => vec![iv],
+            }
+        })
+        .collect();
+
+    pb.finish_with_message("User input parse complete.");
+
+    let final_list: Vec<InputVariant> = chunk_variants.into_iter().flatten().collect();
+    println!("  -> Parsed {} variants from user input.", final_list.len());
+    Ok(final_list)
+}
+
+//-------------------------------------
+// Main
+//-------------------------------------
+
 fn main() -> Result<(), Box<dyn Error>> {
-    // Parse command-line arguments
+    println!("=== Pathogenic Variant Finder (ClinVar .vcf.gz) ===\n");
+
     let args = Args::parse();
     let build = args.build.to_uppercase();
     let input_path = args.input.clone();
 
-    // Validate genome build
+    println!("[STEP] Checking arguments...");
     if build != "GRCH37" && build != "GRCH38" {
-        eprintln!("Error: Genome build must be 'GRCh37' or 'GRCh38'.");
-        std::process::exit(1);
+        return Err(format!("Genome build must be 'GRCh37' or 'GRCh38'").into());
     }
-    // Validate input file
     if !input_path.exists() {
-        eprintln!("Error: Input VCF not found: {}", input_path.display());
-        std::process::exit(1);
+        return Err(format!("Input VCF not found: {}", input_path.display()).into());
     }
 
-    // Decide ClinVar URLs
-    let clinvar_dir = Path::new("clinvar_data");
-    let clinvar_vcf_path = clinvar_dir.join(format!("clinvar_{}.vcf.gz", build));
-    let clinvar_tbi_path = clinvar_vcf_path.with_extension("vcf.gz.tbi");
-    let base_url = match build.as_str() {
-        "GRCH37" => "https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh37/clinvar.vcf.gz",
-        "GRCH38" => "https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh38/clinvar.vcf.gz",
+    // ClinVar file URLs
+    let (clinvar_url, tbi_url) = match build.as_str() {
+        "GRCH37" => (
+            "https://ftp.ncbi.nih.gov/pub/clinvar/vcf_GRCh37/clinvar.vcf.gz",
+            "https://ftp.ncbi.nih.gov/pub/clinvar/vcf_GRCh37/clinvar.vcf.gz.tbi",
+        ),
+        "GRCH38" => (
+            "https://ftp.ncbi.nih.gov/pub/clinvar/vcf_GRCh38/clinvar.vcf.gz",
+            "https://ftp.ncbi.nih.gov/pub/clinvar/vcf_GRCh38/clinvar.vcf.gz.tbi",
+        ),
         _ => unreachable!(),
     };
-    let tbi_url = format!("{}.tbi", base_url);
 
-    // Download ClinVar VCF + TBI if missing
-    if !clinvar_vcf_path.exists() || !clinvar_tbi_path.exists() {
-        fs::create_dir_all(&clinvar_dir)?;
-        eprintln!("No local ClinVar data. Downloading for {build}...");
+    // Local paths
+    let clinvar_dir = Path::new("clinvar_data");
+    let gz_path = clinvar_dir.join(format!("clinvar_{}.vcf.gz", build));
+    let tbi_path = clinvar_dir.join(format!("clinvar_{}.vcf.gz.tbi", build));
 
-        let vcf_path_clone = clinvar_vcf_path.clone();
-        let base_url_clone = base_url.to_string();
-        let vcf_thread = thread::spawn(move || -> Result<(), DownloadError> {
-            download_file(&base_url_clone, &vcf_path_clone)?;
-            Ok(())
-        });
+    println!("[STEP] Checking local ClinVar data in {}...", clinvar_dir.display());
+    fs::create_dir_all(&clinvar_dir)?;
 
-        let tbi_path_clone = clinvar_tbi_path.clone();
-        let tbi_url_clone = tbi_url.clone();
-        let tbi_thread = thread::spawn(move || -> Result<(), DownloadError> {
-            download_file(&tbi_url_clone, &tbi_path_clone)?;
-            Ok(())
-        });
-
-        // Join threads
-        match vcf_thread.join() {
-            Ok(res) => {
-                if let Err(e) = res {
-                    eprintln!("Error downloading ClinVar VCF: {}", e);
-                    std::process::exit(1);
-                }
-            }
-            Err(e) => {
-                eprintln!("Error: thread panicked downloading VCF: {:?}", e);
-                std::process::exit(1);
-            }
-        }
-        match tbi_thread.join() {
-            Ok(res) => {
-                if let Err(e) = res {
-                    eprintln!("Error downloading ClinVar index: {}", e);
-                    std::process::exit(1);
-                }
-            }
-            Err(e) => {
-                eprintln!("Error: thread panicked downloading TBI: {:?}", e);
-                std::process::exit(1);
-            }
-        }
-        eprintln!("ClinVar data downloaded to {}", clinvar_dir.display());
+    // Download if missing
+    if !gz_path.exists() {
+        println!("  -> No local ClinVar gz found. Downloading...");
+        download_file(clinvar_url, &gz_path)?;
+    } else {
+        println!("  -> Found local {}", gz_path.display());
+    }
+    if !tbi_path.exists() {
+        println!("  -> Missing ClinVar index (.tbi). Downloading...");
+        download_file(tbi_url, &tbi_path)?;
+    } else {
+        println!("  -> Found local {}", tbi_path.display());
     }
 
-    // Parse the ClinVar VCF
-    // We'll parse it as .vcf.gz with line-based approach
-    // Then see if we need chr prefix or not after we see the data
-    // We'll guess that the user wants chr prefix if input has it
-    let user_temp_file = File::open(&input_path)?;
-    let user_buf = BufReader::new(user_temp_file);
+    // First, detect if user input wants "chr"
+    // We'll do a quick check on the first data line
+    println!("[STEP] Detecting if user input has 'chr' or not...");
+    let file_check = File::open(&input_path)?;
+    let mut reader = BufReader::new(file_check);
+    let mut line_buf = String::new();
     let mut user_has_chr = false;
-    // read lines until we see the first data line
-    // then see if CHROM has 'chr'
-    let mut in_header = true;
-    for line_res in user_buf.lines() {
-        let line = match line_res {
-            Ok(l) => l,
-            Err(_) => break,
-        };
-        if line.trim().is_empty() {
+    while reader.read_line(&mut line_buf)? > 0 {
+        if line_buf.starts_with('#') || line_buf.trim().is_empty() {
+            line_buf.clear();
             continue;
         }
-        if in_header {
-            if line.starts_with("##") {
-                continue;
-            } else if line.starts_with("#CHROM") {
-                in_header = false;
-                continue;
-            } else {
-                continue;
-            }
-        } else {
-            // data line
-            let chrom_part = line.split('\t').next().unwrap_or("");
-            if chrom_part.starts_with("chr") {
-                user_has_chr = true;
-            }
-            break;
+        let first_col = line_buf.split('\t').next().unwrap_or("");
+        if first_col.starts_with("chr") {
+            user_has_chr = true;
         }
+        break;
     }
+    println!("  -> user input uses chr? {}", user_has_chr);
 
-    // parse ClinVar with knowledge of user_has_chr
-    let clinvar_map = parse_clinvar_vcf_gz(&clinvar_vcf_path, user_has_chr)?;
+    // Parse the ClinVar .vcf.gz in parallel
+    let clinvar_map = parse_clinvar_vcf_gz(&gz_path, user_has_chr)?;
 
-    // parse user input
+    // Parse the user input (uncompressed)
     let input_variants = parse_input_vcf(&input_path, user_has_chr)?;
 
-    // Now match them
+    // Matching
+    println!("\n[STEP] Matching input variants vs. ClinVar...");
     #[derive(Debug)]
     struct OutputRecord {
         chr: String,
         pos: u32,
         ref_allele: String,
-        alt: String,
+        alt_allele: String,
         clnsig: String,
         gene: Option<String>,
         allele_id: Option<i32>,
     }
 
+    let pb = ProgressBar::new(input_variants.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} ({eta})")
+            .unwrap()
+            .progress_chars("=>-"),
+    );
+
+    // Collect in parallel
     let mut results: Vec<OutputRecord> = input_variants
         .par_iter()
-        .flat_map_iter(|var| {
+        .flat_map_iter(|iv| {
+            // For each alt that is present
             let mut found = Vec::new();
-            for (alt, is_present) in &var.alts {
+            for (alt_a, is_present) in &iv.alts {
                 if !is_present {
                     continue;
                 }
-                let key = (var.chr.clone(), var.pos, var.ref_allele.clone(), alt.clone());
-                if let Some(info) = clinvar_map.get(&key) {
+                let key = (iv.chr.clone(), iv.pos, iv.ref_allele.clone(), alt_a.clone());
+                if let Some(cv) = clinvar_map.get(&key) {
                     found.push(OutputRecord {
-                        chr: var.chr.clone(),
-                        pos: var.pos,
-                        ref_allele: var.ref_allele.clone(),
-                        alt: alt.clone(),
-                        clnsig: info.clnsig.clone(),
-                        gene: info.gene.clone(),
-                        allele_id: info.allele_id,
+                        chr: cv.chr.clone(),
+                        pos: cv.pos,
+                        ref_allele: cv.ref_allele.clone(),
+                        alt_allele: cv.alt_allele.clone(),
+                        clnsig: cv.clnsig.clone(),
+                        gene: cv.gene.clone(),
+                        allele_id: cv.allele_id,
                     });
                 }
             }
-            found.into_iter()
+            pb.inc(1);
+            found
         })
         .collect();
 
-    // sort
+    pb.finish_with_message("Match complete.");
+
+    println!("[STEP] Sorting {} matched records...", results.len());
     results.sort_by(|a, b| {
         let c = a.chr.cmp(&b.chr);
         if c == std::cmp::Ordering::Equal {
@@ -581,20 +619,30 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     });
 
-    // output CSV
+    println!("[STEP] Writing CSV to stdout...\n");
     let mut wtr = csv::Writer::from_writer(std::io::stdout());
-    wtr.write_record(&["Chromosome","Position","Ref","Alt","ClinicalSignificance","Gene","ClinVarAlleleID"])?;
-    for rec in results {
+    wtr.write_record(&[
+        "Chromosome",
+        "Position",
+        "Ref",
+        "Alt",
+        "ClinicalSignificance",
+        "Gene",
+        "ClinVarAlleleID",
+    ])?;
+    for rec in &results {
         wtr.write_record(&[
-            rec.chr,
-            rec.pos.to_string(),
-            rec.ref_allele,
-            rec.alt,
-            rec.clnsig,
-            rec.gene.clone().unwrap_or_default(),
-            rec.allele_id.map(|id| id.to_string()).unwrap_or_default()
+            &rec.chr,
+            &rec.pos.to_string(),
+            &rec.ref_allele,
+            &rec.alt_allele,
+            &rec.clnsig,
+            rec.gene.as_deref().unwrap_or(""),
+            &rec.allele_id.map(|id| id.to_string()).unwrap_or_default(),
         ])?;
     }
     wtr.flush()?;
+
+    println!("Done. {} total pathogenic variants matched.\n", results.len());
     Ok(())
 }
