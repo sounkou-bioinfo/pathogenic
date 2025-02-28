@@ -524,6 +524,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         download_file(clinvar_url, &gz_path)?;
     } else {
         println!("  -> Found local {}", gz_path.display());
+        // Verify that the file is valid by decompressing a small portion.
+        // If this fails, remove the file and re-download it.
+        {
+            let check_file = File::open(&gz_path)?;
+            let mut check_decoder = MultiGzDecoder::new(check_file);
+            let mut buffer = [0u8; 1024];
+            if let Err(err) = check_decoder.read(&mut buffer) {
+                println!("  -> Local ClinVar gz appears corrupt ({err}). Removing and re-downloading...");
+                fs::remove_file(&gz_path)?;
+                download_file(clinvar_url, &gz_path)?;
+            }
+        }
     }
     if !tbi_path.exists() {
         println!("  -> Missing ClinVar index (.tbi). Downloading...");
