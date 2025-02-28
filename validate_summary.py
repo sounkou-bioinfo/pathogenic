@@ -8,7 +8,7 @@ columns = [
     'GRCh37_Chromosome', 'GRCh37_PositionVCF', 'GRCh37_ReferenceAlleleVCF', 'GRCh37_AlternateAlleleVCF', 'GRCh37_Start', 'GRCh37_Stop',
     'GRCh38_Chromosome', 'GRCh38_PositionVCF', 'GRCh38_ReferenceAlleleVCF', 'GRCh38_AlternateAlleleVCF', 'GRCh38_Start', 'GRCh38_Stop',
     'MolecularConsequence', 'FunctionalConsequence',
-    'ModeOfInheritance', 'PreferredValues', 'Citations', 'Comments', 'AssertionMethods', 'FamilyData',
+    'ModeOfInheritance', 'PreferredValues', 'Citations', 'Comments', 'FamilyData',
     'RecordStatus', 'ClinicalSignificance', 'ReviewStatus', 'Description', 'DateLastEvaluated'
 ]
 
