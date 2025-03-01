@@ -11,6 +11,9 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use noodles::bgzf::Reader as BgzfReader;
+use noodles::vcf::io::indexed_reader::IndexedReader;
+use noodles::csi;
 
 /// Command-line arguments
 #[derive(Parser)]
@@ -1099,33 +1102,69 @@ fn main() -> Result<(), Box<dyn Error>> {
         .collect();
 
     // Stream 1000 Genomes VCF and extract frequencies for keys_of_interest
-    println!("[STEP] Streaming 1000 Genomes frequency VCF: {}", onekg_file_path.display());
-    writeln!(log_file, "[STEP] Streaming 1000 Genomes frequency VCF: {}", onekg_file_path.display())?;
+    println!("[STEP] Querying 1000 Genomes frequency VCF using CSI index: {}", onekg_file_path.display());
+    writeln!(log_file, "[STEP] Querying 1000 Genomes frequency VCF using CSI index: {}", onekg_file_path.display())?;
+    let onekg_index_path = clinvar_dir.join(format!("1000GENOMES-phase_3_{}_vcf.gz.csi", build));
+    if !onekg_index_path.exists() {
+        println!("  -> Missing 1000 Genomes CSI index for {}. Downloading...", build);
+        writeln!(log_file, "  -> Missing 1000 Genomes CSI index for {}. Downloading...", build)?;
+        download_file(
+            if build == "GRCH37" {
+                "https://ftp.ensembl.org/pub/grch37/variation/vcf/homo_sapiens/1000GENOMES-phase_3.vcf.gz.csi"
+            } else {
+                "https://ftp.ensembl.org/pub/current_variation/vcf/homo_sapiens/1000GENOMES-phase_3.vcf.gz.csi"
+            },
+            &onekg_index_path,
+            &mut log_file
+        )?;
+    }
+
     let file = File::open(&onekg_file_path)?;
-    let decoder = MultiGzDecoder::new(file);
-    let reader = BufReader::new(decoder);
-    let total_lines = 82_663_614; // Approximate total lines for progress bar
-    let pb = ProgressBar::new(total_lines as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} ({eta})")?
-            .progress_chars("=>-"),
-    );
+    let index_file = File::open(&onekg_index_path)?;
+    let mut csi_reader = csi::io::Reader::new(index_file);
+    let index = csi_reader.read_index()?;
+    let mut reader = IndexedReader::new(file, index);
 
     let mut onekg_freqs: HashMap<(String, u32, String, String), OneKgRecord> = HashMap::with_capacity(keys_of_interest.len());
-    for line in reader.lines() {
-        let line = line?;
-        pb.inc(1);
-        if let Some(records) = parse_onekg_line(&line) {
-            for rec in records {
-                let key = (rec.chr.clone(), rec.pos, rec.ref_allele.clone(), rec.alt_allele.clone());
-                if keys_of_interest.contains(&key) {
-                    onekg_freqs.insert(key, rec);
+    let mut unique_regions: HashSet<(String, u32)> = HashSet::new();
+    for (chr, pos, _ref, _alt) in keys_of_interest.iter() {
+        unique_regions.insert((chr.clone(), *pos));
+    }
+    for (chr, pos) in unique_regions {
+        let region = format!("{}:{}-{}", chr, pos, pos);
+        if let Ok(mut query) = reader.query(&region) {
+            while let Some(record) = query.next() {
+                let record = record?;
+                let record_chr = record.chromosome().to_string();
+                let record_pos = record.position();
+                let record_ref = record.reference_bases().to_string();
+                let record_alts: Vec<String> = record.alternate_bases().iter().map(|alt| alt.to_string()).collect();
+                let info = record.info();
+                for alt in record_alts {
+                    let key = (record_chr.clone(), record_pos, record_ref.clone(), alt.clone());
+                    if keys_of_interest.contains(&key) {
+                        let afr = info.get("AFR").and_then(|v| v.first()).and_then(|s| s.parse::<f64>().ok());
+                        let amr = info.get("AMR").and_then(|v| v.first()).and_then(|s| s.parse::<f64>().ok());
+                        let eas = info.get("EAS").and_then(|v| v.first()).and_then(|s| s.parse::<f64>().ok());
+                        let eur = info.get("EUR").and_then(|v| v.first()).and_then(|s| s.parse::<f64>().ok());
+                        let sas = info.get("SAS").and_then(|v| v.first()).and_then(|s| s.parse::<f64>().ok());
+                        let record = OneKgRecord {
+                            chr: record_chr.clone(),
+                            pos: record_pos,
+                            ref_allele: record_ref.clone(),
+                            alt_allele: alt.clone(),
+                            afr,
+                            amr,
+                            eas,
+                            eur,
+                            sas,
+                        };
+                        onekg_freqs.insert(key, record);
+                    }
                 }
             }
         }
     }
-    pb.finish_with_message("1000 Genomes streaming complete.");
     println!("  -> Extracted frequencies for {} variants", onekg_freqs.len());
     writeln!(log_file, "  -> Extracted frequencies for {} variants", onekg_freqs.len())?;
     
