@@ -6,7 +6,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use num_cpus;
 use rayon::prelude::*;
 use reqwest::blocking;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap};
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -59,6 +59,7 @@ impl From<reqwest::Error> for DownloadError {
 fn download_file(url: &str, out_path: &Path, log_file: &mut File) -> Result<(), DownloadError> {
     println!("  -> Downloading from {url} ...");
     writeln!(log_file, "  -> Downloading from {url} ...")?;
+
     let mut response = blocking::get(url)?;
 
     let total_size = response
@@ -71,9 +72,7 @@ fn download_file(url: &str, out_path: &Path, log_file: &mut File) -> Result<(), 
     let pb = ProgressBar::new(total_size);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})",
-            )
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
             .unwrap()
             .progress_chars("=>-"),
     );
@@ -103,7 +102,6 @@ struct ClinVarRecord {
     ref_allele: String,
     alt_allele: String,
     clnsig: String,
-    // True if ALT is pathogenic, false if REF is pathogenic and ALT is benign/protective
     is_alt_pathogenic: bool,
     gene: Option<String>,
     allele_id: Option<i32>,
@@ -114,8 +112,84 @@ struct ClinVarRecord {
     af_tgp: Option<f64>,
 }
 
-/// Container for ClinVar variants keyed by (chr, pos, ref, alt)
 type ClinVarMap = HashMap<(String, u32, String, String), ClinVarRecord>;
+
+/// A structure for user input variants.
+#[derive(Debug)]
+struct InputVariant {
+    chr: String,
+    pos: u32,
+    ref_allele: String,
+    alts: Vec<(String, bool)>, // (alt_allele, is_present_in_genotype)
+    genotype: String,
+}
+
+/// Parse a user input VCF line
+fn parse_input_line(line: &str) -> Option<(String, InputVariant)> {
+    if line.starts_with('#') || line.trim().is_empty() {
+        return None;
+    }
+    let mut fields = line.split('\t');
+    let chrom = fields.next()?.to_string();
+    let pos_str = fields.next()?;
+    let _ = fields.next(); // ID
+    let ref_allele = fields.next()?;
+    let alt_allele = fields.next()?;
+    let _ = fields.next(); // QUAL
+    let _ = fields.next(); // FILTER
+    let _ = fields.next(); // INFO
+    let pos_num: u32 = pos_str.parse().ok()?;
+    let chr_fixed = if chrom.eq_ignore_ascii_case("chrM") || chrom.eq_ignore_ascii_case("chrMT") {
+        "MT".to_string()
+    } else if let Some(stripped) = chrom.strip_prefix("chr") {
+        stripped.to_string()
+    } else {
+        chrom.to_string()
+    };
+    let alt_list: Vec<String> = alt_allele.split(',').map(|s| s.to_string()).collect();
+    let mut present_flags = std::collections::HashSet::new();
+    let genotype = if let Some(format_str) = fields.next() {
+        let format_items: Vec<&str> = format_str.split(':').collect();
+        if let Some(gt_index) = format_items.iter().position(|&f| f == "GT") {
+            if let Some(sample_str) = fields.next() {
+                let sample_items: Vec<&str> = sample_str.split(':').collect();
+                if gt_index < sample_items.len() {
+                    sample_items[gt_index].to_string()
+                } else {
+                    "1/1".to_string()
+                }
+            } else {
+                "1/1".to_string()
+            }
+        } else {
+            "1/1".to_string()
+        }
+    } else {
+        "1/1".to_string()
+    };
+    for g in genotype.split(&['/', '|'][..]) {
+        if let Ok(idx) = g.parse::<usize>() {
+            if idx >= 1 {
+                present_flags.insert(idx);
+            }
+        }
+    }
+    let mut alts = Vec::with_capacity(alt_list.len());
+    for (i, alt_a) in alt_list.into_iter().enumerate() {
+        let alt_idx = i + 1;
+        let is_present = present_flags.contains(&alt_idx);
+        alts.push((alt_a, is_present));
+    }
+    Some((line.to_string(), InputVariant {
+        chr: chr_fixed,
+        pos: pos_num,
+        ref_allele: ref_allele.to_string(),
+        alts,
+        genotype,
+    }))
+}
+
+
 
 /// Parse the semicolon-delimited INFO field into a HashMap
 fn parse_info_field(info_str: &str) -> HashMap<String, String> {
@@ -144,9 +218,7 @@ fn review_status_to_stars(status: Option<&str>) -> u8 {
 }
 
 /// Parse a ClinVar VCF line into zero or more ClinVarRecords
-fn parse_clinvar_line(
-    line: &str,
-) -> Option<Vec<ClinVarRecord>> {
+fn parse_clinvar_line(line: &str) -> Option<Vec<ClinVarRecord>> {
     if line.starts_with('#') || line.trim().is_empty() {
         return None;
     }
@@ -237,7 +309,6 @@ fn parse_clinvar_vcf_gz(
     let f = File::open(path_gz)?;
     let decoder = MultiGzDecoder::new(f);
     let reader = BufReader::new(decoder);
-    // Process lines in parallel without full decompression into memory
     let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
     let total = lines.len() as u64;
 
@@ -254,7 +325,6 @@ fn parse_clinvar_vcf_gz(
     )?;
 
     let mut clinvar_file_date = String::new();
-    // Determine the ClinVar file date.
     for line in &lines {
         if line.starts_with('#') {
             if line.starts_with("##fileDate") {
@@ -309,290 +379,6 @@ fn parse_clinvar_vcf_gz(
     println!("  -> Final ClinVar map size: {}", final_map.len());
     writeln!(log_file, "  -> Final ClinVar map size: {}", final_map.len())?;
     Ok((final_map, clinvar_file_date))
-}
-
-/// Struct for user input variants
-#[derive(Debug)]
-struct InputVariant {
-    chr: String,
-    pos: u32,
-    ref_allele: String,
-    alts: Vec<(String, bool)>, // (alt_allele, is_present_in_genotype)
-    genotype: String,
-}
-
-/// A specialized type for records from the ClinVar pathogenic summary TSV.
-#[derive(Debug, Clone)]
-struct ClinVarTsvRecord {
-    molecular_consequence: Option<String>,
-    functional_consequence: Option<String>,
-    mode_of_inheritance: Option<String>,
-    preferred_values: Option<String>,
-    citations: Option<String>,
-    comments: Option<String>,
-    family_data: Option<String>,
-    record_status: Option<String>,
-    description: Option<String>,
-    date_last_evaluated: Option<String>,
-}
-
-/// Parse the ClinVar pathogenic summary TSV, returning a HashMap keyed by (chr, pos, ref, alt).
-/// This function uses columns named GRCh37_Chromosome, GRCh37_PositionVCF, GRCh37_ReferenceAlleleVCF,
-/// GRCh37_AlternateAlleleVCF or GRCh38_Chromosome, etc., depending on the selected genome build.
-/// It stores additional annotation fields in a ClinVarTsvRecord.
-fn parse_clinvar_tsv(
-    tsv_path: &Path,
-    build: &str,
-    log_file: &mut File,
-) -> Result<HashMap<(String, u32, String, String), ClinVarTsvRecord>, Box<dyn Error>> {
-    println!("[STEP] Parsing ClinVar summary TSV: {}", tsv_path.display());
-    writeln!(
-        log_file,
-        "[STEP] Parsing ClinVar summary TSV: {}",
-        tsv_path.display()
-    )?;
-
-    let file = File::open(tsv_path)?;
-    let reader: Box<dyn BufRead> = if tsv_path
-        .extension()
-        .map(|e| e.to_str().unwrap_or(""))
-        .unwrap_or("")
-        == "xz"
-    {
-        Box::new(BufReader::new(xz2::read::XzDecoder::new(file)))
-    } else {
-        Box::new(BufReader::new(file))
-    };
-
-    let mut line_count = 0;
-    let mut map = HashMap::new();
-    let mut header_indices: Option<HashMap<String, usize>> = None;
-
-    // Identify columns we care about:
-    // GRCh37_Chromosome, GRCh37_PositionVCF, GRCh37_ReferenceAlleleVCF, GRCh37_AlternateAlleleVCF
-    // GRCh38_Chromosome, GRCh38_PositionVCF, GRCh38_ReferenceAlleleVCF, GRCh38_AlternateAlleleVCF
-    // plus other columns for annotation.
-    let want_37 = build == "GRCH37";
-
-    for line_result in reader.lines() {
-        let line = line_result?;
-        line_count += 1;
-        if line_count == 1 {
-            // Header row
-            let headers: Vec<&str> = line.split('\t').collect();
-            header_indices = Some(
-                headers
-                    .iter()
-                    .enumerate()
-                    .map(|(i, h)| (h.to_string(), i))
-                    .collect(),
-            );
-            continue;
-        }
-
-        let cols: Vec<&str> = line.split('\t').collect();
-        if cols.len() < 28 {
-            continue;
-        }
-
-        let hmap = header_indices.as_ref().unwrap();
-
-        let c_chr = if want_37 {
-            hmap.get("GRCh37_Chromosome")
-        } else {
-            hmap.get("GRCh38_Chromosome")
-        };
-        let c_pos = if want_37 {
-            hmap.get("GRCh37_PositionVCF")
-        } else {
-            hmap.get("GRCh38_PositionVCF")
-        };
-        let c_ref = if want_37 {
-            hmap.get("GRCh37_ReferenceAlleleVCF")
-        } else {
-            hmap.get("GRCh38_ReferenceAlleleVCF")
-        };
-        let c_alt = if want_37 {
-            hmap.get("GRCh37_AlternateAlleleVCF")
-        } else {
-            hmap.get("GRCh38_AlternateAlleleVCF")
-        };
-
-        if c_chr.is_none() || c_pos.is_none() || c_ref.is_none() || c_alt.is_none() {
-            continue;
-        }
-
-        let chr_index = *c_chr.unwrap();
-        let pos_index = *c_pos.unwrap();
-        let ref_index = *c_ref.unwrap();
-        let alt_index = *c_alt.unwrap();
-
-        let chr_val = cols.get(chr_index).unwrap_or(&"").trim();
-        let pos_val = cols.get(pos_index).unwrap_or(&"").trim();
-        let ref_val = cols.get(ref_index).unwrap_or(&"").trim();
-        let alt_val = cols.get(alt_index).unwrap_or(&"").trim();
-
-        let pos_parsed = pos_val.parse::<u32>().unwrap_or(0);
-        if chr_val.is_empty() || pos_parsed == 0 || ref_val.is_empty() || alt_val.is_empty() {
-            continue;
-        }
-
-        // Adjust for potential "MT" vs "chrM" mismatch if needed. We'll normalize to no "chr" prefix.
-        let norm_chr =
-            if chr_val.eq_ignore_ascii_case("chrM") || chr_val.eq_ignore_ascii_case("chrMT") {
-                "MT".to_string()
-            } else if let Some(stripped) = chr_val.strip_prefix("chr") {
-                stripped.to_string()
-            } else {
-                chr_val.to_string()
-            };
-
-        let rec = ClinVarTsvRecord {
-            molecular_consequence: hmap
-                .get("MolecularConsequence")
-                .and_then(|&idx| cols.get(idx).map(|s| s.to_string()))
-                .filter(|s| !s.is_empty()),
-            functional_consequence: hmap
-                .get("FunctionalConsequence")
-                .and_then(|&idx| cols.get(idx).map(|s| s.to_string()))
-                .filter(|s| !s.is_empty()),
-            mode_of_inheritance: hmap
-                .get("ModeOfInheritance")
-                .and_then(|&idx| cols.get(idx).map(|s| s.to_string()))
-                .filter(|s| !s.is_empty()),
-            preferred_values: hmap
-                .get("PreferredValues")
-                .and_then(|&idx| cols.get(idx).map(|s| s.to_string()))
-                .filter(|s| !s.is_empty()),
-            citations: hmap
-                .get("Citations")
-                .and_then(|&idx| cols.get(idx).map(|s| s.to_string()))
-                .filter(|s| !s.is_empty()),
-            comments: hmap
-                .get("Comments")
-                .and_then(|&idx| cols.get(idx).map(|s| s.to_string()))
-                .filter(|s| !s.is_empty()),
-            family_data: hmap
-                .get("FamilyData")
-                .and_then(|&idx| cols.get(idx).map(|s| s.to_string()))
-                .filter(|s| !s.is_empty()),
-            record_status: hmap
-                .get("RecordStatus")
-                .and_then(|&idx| cols.get(idx).map(|s| s.to_string()))
-                .filter(|s| !s.is_empty()),
-            description: hmap
-                .get("Description")
-                .and_then(|&idx| cols.get(idx).map(|s| s.to_string()))
-                .filter(|s| !s.is_empty()),
-            date_last_evaluated: hmap
-                .get("DateLastEvaluated")
-                .and_then(|&idx| cols.get(idx).map(|s| s.to_string()))
-                .filter(|s| !s.is_empty()),
-        };
-
-        let key = (
-            norm_chr,
-            pos_parsed,
-            ref_val.to_string(),
-            alt_val.to_string(),
-        );
-        map.insert(key, rec);
-    }
-
-    println!("  -> Parsed {} lines from summary TSV.", line_count - 1);
-    writeln!(
-        log_file,
-        "  -> Parsed {} lines from summary TSV.",
-        line_count - 1
-    )?;
-    Ok(map)
-}
-
-/// Parse a user input VCF line
-fn parse_input_line(
-    line: &str,
-) -> Option<(String, InputVariant)> {
-    if line.starts_with('#') || line.trim().is_empty() {
-        return None;
-    }
-
-    let mut fields = line.split('\t');
-    let chrom = fields.next()?.to_string();
-    let pos_str = fields.next()?;
-    let _ = fields.next(); // ID
-    let ref_allele = fields.next()?;
-    let alt_allele = fields.next()?;
-    let _ = fields.next(); // QUAL
-    let _ = fields.next(); // FILTER
-    let _ = fields.next(); // INFO
-
-    let mut rest_cols = Vec::new();
-    for c in fields {
-        rest_cols.push(c);
-    }
-
-    let pos_num: u32 = pos_str.parse().ok()?;
-    let chr_fixed = if chrom.eq_ignore_ascii_case("chrM") || chrom.eq_ignore_ascii_case("chrMT") {
-        "MT".to_string()
-    } else if let Some(stripped) = chrom.strip_prefix("chr") {
-        stripped.to_string()
-    } else {
-        chrom.to_string()
-    };
-
-    let alt_list: Vec<String> = alt_allele.split(',').map(|s| s.to_string()).collect();
-    let mut present_flags = HashSet::new();
-
-    let genotype = if !rest_cols.is_empty() {
-        let format_str = rest_cols[0];
-        let format_items: Vec<&str> = format_str.split(':').collect();
-        if let Some(gt_index) = format_items.iter().position(|&f| f == "GT") {
-            if rest_cols.len() > 1 {
-                let sample_str = rest_cols[1];
-                let sample_items: Vec<&str> = sample_str.split(':').collect();
-                if gt_index < sample_items.len() {
-                    sample_items[gt_index].to_string()
-                } else {
-                    "1/1".to_string() // Default homozygous alternate
-                }
-            } else {
-                "1/1".to_string()
-            }
-        } else {
-            "1/1".to_string()
-        }
-    } else {
-        "1/1".to_string()
-    };
-
-    if !genotype.is_empty() {
-        let split_gt: Vec<&str> = genotype.split(&['/', '|'][..]).collect();
-        for g in split_gt {
-            if let Ok(idx) = g.parse::<usize>() {
-                if idx >= 1 {
-                    present_flags.insert(idx);
-                }
-            }
-        }
-    }
-
-    let mut alts = Vec::with_capacity(alt_list.len());
-    for (i, alt_a) in alt_list.into_iter().enumerate() {
-        let alt_idx = i + 1;
-        let is_present = present_flags.contains(&alt_idx);
-        alts.push((alt_a, is_present));
-    }
-
-    Some((
-        line.to_string(),
-        InputVariant {
-            chr: chr_fixed,
-            pos: pos_num,
-            ref_allele: ref_allele.to_string(),
-            alts,
-            genotype,
-        },
-    ))
 }
 
 /// Parse the user input VCF (uncompressed)
@@ -761,31 +547,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         writeln!(log_file, "  -> Found local {}", tbi_path.display())?;
     }
 
-    println!("[STEP] Detecting if user input has 'chr' or not...");
-    writeln!(
-        log_file,
-        "[STEP] Detecting if user input has 'chr' or not..."
-    )?;
-    let file_check = File::open(&input_path)?;
-    let mut reader = BufReader::new(file_check);
-    let mut line_buf = String::new();
-    let mut user_has_chr = false;
-    while reader.read_line(&mut line_buf)? > 0 {
-        if line_buf.starts_with('#') || line_buf.trim().is_empty() {
-            line_buf.clear();
-            continue;
-        }
-        let first_col = line_buf.split('\t').next().unwrap_or("");
-        if first_col.starts_with("chr") {
-            user_has_chr = true;
-        }
-        break;
-    }
-    println!("  -> user input uses chr? {}", user_has_chr);
-    writeln!(log_file, "  -> user input uses chr? {}", user_has_chr)?;
-
-    let (clinvar_map, clinvar_file_date) =
-        parse_clinvar_vcf_gz(&gz_path, &mut log_file)?;
+    let (clinvar_map, clinvar_file_date) = parse_clinvar_vcf_gz(&gz_path, &mut log_file)?;
     println!("[LOG] ClinVar File Date: {}", clinvar_file_date);
     writeln!(log_file, "[LOG] ClinVar File Date: {}", clinvar_file_date)?;
 
@@ -800,7 +562,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         ref_allele: String,
         alt_allele: String,
         clnsig: String,
-        // True if ALT is pathogenic, false if REF is pathogenic and ALT is benign/protective
         is_alt_pathogenic: bool,
         gene: Option<String>,
         allele_id: Option<i32>,
@@ -858,7 +619,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             found
         })
         .collect();
-
     pb.finish_with_message("Match complete.");
 
     // Log matched variants after collection to avoid ? in closure
@@ -892,104 +652,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("[STEP] Writing CSV to stdout...\n");
     writeln!(log_file, "[STEP] Writing CSV to stdout...\n")?;
 
-    // Step: Check for local TSV or download it if necessary.
-    let tsv_dir = Path::new("clinvar_data");
-    fs::create_dir_all(&tsv_dir)?;
-    let tsv_local_path = tsv_dir.join("clinvar_summary_pathogenic.tsv.xz");
-    if !tsv_local_path.exists() {
-        println!("  -> Downloading summary TSV from GitHub...");
-        writeln!(log_file, "  -> Downloading summary TSV from GitHub...")?;
-        download_file(
-                "https://raw.githubusercontent.com/SauersML/pathogenic/main/clinvar_summary_pathogenic.tsv.xz",
-                &tsv_local_path,
-                &mut log_file,
-            )?;
-    } else {
-        println!("  -> Found local {}", tsv_local_path.display());
-        writeln!(log_file, "  -> Found local {}", tsv_local_path.display())?;
-    }
-
-    // Parse the TSV, build a map for additional annotations.
-    let tsv_map = parse_clinvar_tsv(&tsv_local_path, &build, &mut log_file)?;
-
-    // Extend the OutputRecord struct to hold TSV fields.
-    #[derive(Debug)]
-    struct FinalRecord {
-        chr: String,
-        pos: u32,
-        ref_allele: String,
-        alt_allele: String,
-        clnsig: String,
-        is_alt_pathogenic: bool,
-        gene: Option<String>,
-        allele_id: Option<i32>,
-        genotype: String,
-        review_stars: u8,
-        af_esp: Option<f64>,
-        af_exac: Option<f64>,
-        af_tgp: Option<f64>,
-        clndn: Option<String>,
-        molecular_consequence: Option<String>,
-        functional_consequence: Option<String>,
-        mode_of_inheritance: Option<String>,
-        preferred_values: Option<String>,
-        citations: Option<String>,
-        comments: Option<String>,
-        family_data: Option<String>,
-        record_status: Option<String>,
-        description: Option<String>,
-        date_last_evaluated: Option<String>,
-    }
-
-    // Merge the TSV annotations into a new vector of final records.
-    let mut final_records = Vec::new();
-    for r in results {
-        let key = (
-            r.chr.clone(),
-            r.pos,
-            r.ref_allele.clone(),
-            r.alt_allele.clone(),
-        );
-        let annotation = tsv_map.get(&key);
-        let final_rec = FinalRecord {
-            chr: r.chr,
-            pos: r.pos,
-            ref_allele: r.ref_allele,
-            alt_allele: r.alt_allele,
-            clnsig: r.clnsig,
-            is_alt_pathogenic: r.is_alt_pathogenic,
-            gene: r.gene,
-            allele_id: r.allele_id,
-            genotype: r.genotype,
-            review_stars: r.review_stars,
-            af_esp: r.af_esp,
-            af_exac: r.af_exac,
-            af_tgp: r.af_tgp,
-            clndn: r.clndn,
-            molecular_consequence: annotation.and_then(|ann| ann.molecular_consequence.clone()),
-            functional_consequence: annotation.and_then(|ann| ann.functional_consequence.clone()),
-            mode_of_inheritance: annotation.and_then(|ann| ann.mode_of_inheritance.clone()),
-            preferred_values: annotation.and_then(|ann| ann.preferred_values.clone()),
-            citations: annotation.and_then(|ann| ann.citations.clone()),
-            comments: annotation.and_then(|ann| ann.comments.clone()),
-            family_data: annotation.and_then(|ann| ann.family_data.clone()),
-            record_status: annotation.and_then(|ann| ann.record_status.clone()),
-            description: annotation.and_then(|ann| ann.description.clone()),
-            date_last_evaluated: annotation.and_then(|ann| ann.date_last_evaluated.clone()),
-        };
-        final_records.push(final_rec);
-    }
-
-    // Sort final records again by chr and pos, to be consistent.
-    final_records.sort_by(|a, b| {
-        let c = a.chr.cmp(&b.chr);
-        if c == std::cmp::Ordering::Equal {
-            a.pos.cmp(&b.pos)
-        } else {
-            c
-        }
-    });
-
     let mut wtr = csv::Writer::from_writer(std::io::stdout());
     wtr.write_record(&[
         "Chromosome",
@@ -1006,19 +668,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         "AF_ESP",
         "AF_EXAC",
         "AF_TGP",
-        "Molecular Consequence",
-        "Functional Consequence",
-        "Mode of Inheritance",
-        "Preferred Values",
-        "Citations",
-        "Comments",
-        "Family Data",
-        "Record Status",
-        "Description",
-        "Date Last Evaluated",
     ])?;
 
-    for rec in &final_records {
+    for rec in &results {
         wtr.write_record(&[
             &rec.chr,
             &rec.pos.to_string(),
@@ -1034,28 +686,19 @@ fn main() -> Result<(), Box<dyn Error>> {
             &rec.af_esp.map(|f| f.to_string()).unwrap_or_default(),
             &rec.af_exac.map(|f| f.to_string()).unwrap_or_default(),
             &rec.af_tgp.map(|f| f.to_string()).unwrap_or_default(),
-            rec.molecular_consequence.as_deref().unwrap_or(""),
-            rec.functional_consequence.as_deref().unwrap_or(""),
-            rec.mode_of_inheritance.as_deref().unwrap_or(""),
-            rec.preferred_values.as_deref().unwrap_or(""),
-            rec.citations.as_deref().unwrap_or(""),
-            rec.comments.as_deref().unwrap_or(""),
-            rec.family_data.as_deref().unwrap_or(""),
-            rec.record_status.as_deref().unwrap_or(""),
-            rec.description.as_deref().unwrap_or(""),
-            rec.date_last_evaluated.as_deref().unwrap_or(""),
         ])?;
     }
 
     wtr.flush()?;
     println!(
-        "Done. Wrote {} variants to CSV, enriched with TSV data.",
-        final_records.len()
+        "Done. Wrote {} variants to CSV, enriched with Allele Frequency data.",
+        results.len()
     );
     writeln!(
         log_file,
-        "Done. Wrote {} variants to CSV, enriched with TSV data.",
-        final_records.len()
+        "Done. Wrote {} variants to CSV, enriched with Allele Frequency data.",
+        results.len()
     )?;
+
     Ok(())
 }
