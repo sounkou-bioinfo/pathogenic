@@ -251,7 +251,7 @@ fn parse_clinvar_vcf_gz(
     )?;
 
     let mut clinvar_file_date = String::new();
-    let mut clinvar_has_chr = false;
+    // Determine the ClinVar file date.
     for line in &lines {
         if line.starts_with('#') {
             if line.starts_with("##fileDate") {
@@ -259,10 +259,6 @@ fn parse_clinvar_vcf_gz(
                 break;
             }
             continue;
-        }
-        let chrom_part = line.split('\t').next().unwrap_or("");
-        if chrom_part.starts_with("chr") {
-            clinvar_has_chr = true;
         }
         break;
     }
@@ -512,7 +508,6 @@ fn parse_clinvar_tsv(
 /// Parse a user input VCF line
 fn parse_input_line(
     line: &str,
-    user_has_chr: bool,
 ) -> Option<(String, InputVariant)> {
     if line.starts_with('#') || line.trim().is_empty() {
         return None;
@@ -637,18 +632,6 @@ fn parse_input_vcf(
     let lines: Vec<&str> = contents.lines().collect();
     let total = lines.len() as u64;
 
-    let mut user_has_chr = false;
-    for &l in &lines {
-        if l.starts_with('#') || l.trim().is_empty() {
-            continue;
-        }
-        let chrom_part = l.split('\t').next().unwrap_or("");
-        if chrom_part.starts_with("chr") {
-            user_has_chr = true;
-        }
-        break;
-    }
-
     let pb = ProgressBar::new(total);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -661,7 +644,7 @@ fn parse_input_vcf(
         .par_iter()
         .map(|&line| {
             pb.inc(1);
-            match parse_input_line(line, user_has_chr) {
+            match parse_input_line(line) {
                 None => vec![],
                 Some((line, iv)) => vec![(line, iv)],
             }
