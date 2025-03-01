@@ -108,6 +108,7 @@ struct ClinVarRecord {
     gene: Option<String>,
     allele_id: Option<i32>,
     clnrevstat: Option<String>,
+    clndn: Option<String>,
     af_esp: Option<f64>,
     af_exac: Option<f64>,
     af_tgp: Option<f64>,
@@ -198,6 +199,7 @@ fn parse_clinvar_line(
     let af_esp = info_map.get("AF_ESP").and_then(|s| s.parse::<f64>().ok());
     let af_exac = info_map.get("AF_EXAC").and_then(|s| s.parse::<f64>().ok());
     let af_tgp = info_map.get("AF_TGP").and_then(|s| s.parse::<f64>().ok());
+    let clndn = info_map.get("CLNDN").cloned();
 
     let mut recs = Vec::with_capacity(alt_list.len());
     for alt_a in alt_list {
@@ -211,6 +213,7 @@ fn parse_clinvar_line(
             gene: gene_opt.clone(),
             allele_id: allele_id_opt,
             clnrevstat: clnrevstat.clone(),
+            clndn: clndn.clone(),
             af_esp,
             af_exac,
             af_tgp,
@@ -806,7 +809,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         af_esp: Option<f64>,
         af_exac: Option<f64>,
         af_tgp: Option<f64>,
-        inheritance: String,
+        clndn: Option<String>,
     }
 
     let pb = ProgressBar::new(input_variants.len() as u64);
@@ -833,22 +836,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                     let genotype = iv.genotype.clone();
                     let review_stars = review_status_to_stars(cv.clnrevstat.as_deref());
-                    let split_gt: Vec<&str> = genotype.split(&['/', '|'][..]).collect();
-                    // Infer inheritance based on genotype
-                    let inheritance = if split_gt.len() > 0
-                        && split_gt[0] != "0"
-                        && (split_gt.len() == 1 || split_gt[0] != split_gt[1])
-                    {
-                        // Haploid or heterozygous cases
-                        "Likely Dominant".to_string()
-                    } else if split_gt.len() == 2
-                        && split_gt[0] == split_gt[1]
-                        && split_gt[0] != "0"
-                    {
-                        "Dominant or Recessive".to_string()
-                    } else {
-                        "Unknown".to_string()
-                    };
                     found.push(OutputRecord {
                         chr: cv.chr.clone(),
                         pos: cv.pos,
@@ -858,12 +845,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                         is_alt_pathogenic: cv.is_alt_pathogenic,
                         gene: cv.gene.clone(),
                         allele_id: cv.allele_id,
-                        genotype,
-                        review_stars,
+                        genotype: genotype,
+                        review_stars: review_stars,
                         af_esp: cv.af_esp,
                         af_exac: cv.af_exac,
                         af_tgp: cv.af_tgp,
-                        inheritance,
+                        clndn: cv.clndn.clone(),
                     });
                 }
             }
@@ -941,7 +928,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         af_esp: Option<f64>,
         af_exac: Option<f64>,
         af_tgp: Option<f64>,
-        inheritance: String,
+        clndn: Option<String>,
         molecular_consequence: Option<String>,
         functional_consequence: Option<String>,
         mode_of_inheritance: Option<String>,
@@ -978,7 +965,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             af_esp: r.af_esp,
             af_exac: r.af_exac,
             af_tgp: r.af_tgp,
-            inheritance: r.inheritance,
+            clndn: r.clndn,
             molecular_consequence: annotation.and_then(|ann| ann.molecular_consequence.clone()),
             functional_consequence: annotation.and_then(|ann| ann.functional_consequence.clone()),
             mode_of_inheritance: annotation.and_then(|ann| ann.mode_of_inheritance.clone()),
@@ -1013,12 +1000,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         "Is Alt Pathogenic",
         "Gene",
         "ClinVar Allele ID",
+        "CLNDN",
         "Genotype",
         "Review Stars",
         "AF_ESP",
         "AF_EXAC",
         "AF_TGP",
-        "Inheritance",
         "Molecular Consequence",
         "Functional Consequence",
         "Mode of Inheritance",
@@ -1041,12 +1028,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             &rec.is_alt_pathogenic.to_string(),
             rec.gene.as_deref().unwrap_or(""),
             &rec.allele_id.map(|id| id.to_string()).unwrap_or_default(),
+            rec.clndn.as_deref().unwrap_or(""),
             &rec.genotype,
             &rec.review_stars.to_string(),
             &rec.af_esp.map(|f| f.to_string()).unwrap_or_default(),
             &rec.af_exac.map(|f| f.to_string()).unwrap_or_default(),
             &rec.af_tgp.map(|f| f.to_string()).unwrap_or_default(),
-            &rec.inheritance,
             rec.molecular_consequence.as_deref().unwrap_or(""),
             rec.functional_consequence.as_deref().unwrap_or(""),
             rec.mode_of_inheritance.as_deref().unwrap_or(""),
