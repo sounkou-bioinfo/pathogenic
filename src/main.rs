@@ -202,8 +202,8 @@ fn review_status_to_stars(status: Option<&str>) -> u8 {
 /// Custom error to unify reading different VCFs (ClinVar or 1000G)
 #[derive(Debug)]
 enum VcfReadError {
-    Io(std::io::Error),
-    Parse(std::num::ParseIntError),
+    Io(()),
+    Parse(()),
 }
 
 impl From<std::io::Error> for VcfReadError {
