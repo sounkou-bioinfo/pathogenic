@@ -55,46 +55,135 @@ impl From<reqwest::Error> for DownloadError {
     }
 }
 
-/// Download a remote file with a progress bar, if not already present locally.
+/// Download a remote file with a progress bar using parallel chunk downloads,
+/// if the server supports HTTP range requests. Otherwise, fall back to a single-threaded download.
 fn download_file(
     url: &str,
     out_path: &Path,
     log_file: &mut File,
 ) -> Result<(), DownloadError> {
-    println!("  -> Downloading from {url}");
-    writeln!(log_file, "  -> Downloading from {url}")?;
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    };
+    use std::thread;
 
-    let mut response = blocking::get(url)?;
+    println!("  -> Starting download from {url}");
+    writeln!(log_file, "  -> Starting download from {url}")?;
 
-    let total_size = response
+    // Create a blocking client.
+    let client = reqwest::blocking::Client::new();
+
+    // Perform a HEAD request to get the file size and check for range support.
+    let head_resp = client.head(url).send()?;
+    let total_size = head_resp
         .headers()
         .get(reqwest::header::CONTENT_LENGTH)
-        .and_then(|ct_len| ct_len.to_str().ok())
-        .and_then(|s| s.parse().ok())
+        .and_then(|s| s.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
+    let accept_ranges = head_resp
+        .headers()
+        .get(reqwest::header::ACCEPT_RANGES)
+        .and_then(|s| s.to_str().ok())
+        .unwrap_or("");
 
+    // If total size is unknown or the server does not support ranges, fall back to single-threaded download.
+    if total_size == 0 || accept_ranges != "bytes" {
+        println!("  -> Server does not support parallel downloads. Falling back to single-threaded download.");
+        writeln!(log_file, "  -> Server does not support parallel downloads. Falling back to single-threaded download.")?;
+        let mut response = client.get(url).send()?;
+        let pb = ProgressBar::new(total_size);
+        pb.set_style(
+            indicatif::ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+                .unwrap()
+                .progress_chars("=>-"),
+        );
+        let mut file = File::create(out_path)?;
+        let mut downloaded: u64 = 0;
+        let mut buffer = [0u8; 8192];
+        loop {
+            let bytes_read = response.read(&mut buffer)?;
+            if bytes_read == 0 { break; }
+            file.write_all(&buffer[..bytes_read])?;
+            downloaded += bytes_read as u64;
+            pb.set_position(downloaded);
+        }
+        pb.finish_with_message("Download complete");
+        return Ok(());
+    }
+
+    // Use parallel downloads: split file into chunks.
+    let num_chunks = num_cpus::get();
+    let chunk_size = total_size / num_chunks as u64;
+    let mut ranges = Vec::new();
+    for i in 0..num_chunks {
+        let start = i as u64 * chunk_size;
+        let end = if i == num_chunks - 1 {
+            total_size - 1
+        } else {
+            (i as u64 + 1) * chunk_size - 1
+        };
+        ranges.push((start, end));
+    }
+
+    // Shared atomic counter for progress.
+    let progress = Arc::new(AtomicU64::new(0));
+    let mut handles = Vec::new();
+
+    for (i, (start, end)) in ranges.into_iter().enumerate() {
+        let client = client.clone();
+        let url = url.to_string();
+        let progress = Arc::clone(&progress);
+        let handle = thread::spawn(move || -> Result<(usize, Vec<u8>), DownloadError> {
+            let range_header = format!("bytes={}-{}", start, end);
+            let mut resp = client.get(&url)
+                .header(reqwest::header::RANGE, range_header)
+                .send()?;
+            let mut buf = Vec::new();
+            let mut local_buf = [0u8; 8192];
+            loop {
+                let n = resp.read(&mut local_buf)?;
+                if n == 0 { break; }
+                buf.extend_from_slice(&local_buf[..n]);
+                progress.fetch_add(n as u64, Ordering::Relaxed);
+            }
+            Ok((i, buf))
+        });
+        handles.push(handle);
+    }
+
+    // Set up a progress bar that is updated by the atomic counter.
     let pb = ProgressBar::new(total_size);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{total_bytes} ({eta})")
             .unwrap()
             .progress_chars("=>-"),
     );
 
-    let mut file = File::create(out_path)?;
-    let mut downloaded: u64 = 0;
-    let mut buffer = [0u8; 8192];
-    loop {
-        let bytes_read = response.read(&mut buffer)?;
-        if bytes_read == 0 {
-            break;
-        }
-        file.write_all(&buffer[..bytes_read])?;
-        downloaded += bytes_read as u64;
-        pb.set_position(downloaded);
+    while progress.load(Ordering::Relaxed) < total_size {
+        pb.set_position(progress.load(Ordering::Relaxed));
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
     pb.finish_with_message("Download complete");
 
+    // Collect results from all threads.
+    let mut chunks: Vec<(usize, Vec<u8>)> = Vec::with_capacity(handles.len());
+    for handle in handles {
+        chunks.push(handle.join().map_err(|_| DownloadError::Io(
+            std::io::Error::new(std::io::ErrorKind::Other, "Thread join error")
+        ))?);
+    }
+    // Sort chunks by their index.
+    chunks.sort_by_key(|(idx, _)| *idx);
+
+    // Write the combined data to the output file.
+    let mut file = File::create(out_path)?;
+    for (_i, data) in chunks {
+        file.write_all(&data)?;
+    }
     Ok(())
 }
 
