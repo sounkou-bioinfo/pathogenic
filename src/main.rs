@@ -513,7 +513,6 @@ fn parse_clinvar_tsv(
 fn parse_input_line(
     line: &str,
     user_has_chr: bool,
-    need_chr: bool,
 ) -> Option<(String, InputVariant)> {
     if line.starts_with('#') || line.trim().is_empty() {
         return None;
@@ -662,7 +661,7 @@ fn parse_input_vcf(
         .par_iter()
         .map(|&line| {
             pb.inc(1);
-            match parse_input_line(line, user_has_chr, need_chr) {
+            match parse_input_line(line, user_has_chr) {
                 None => vec![],
                 Some((line, iv)) => vec![(line, iv)],
             }
