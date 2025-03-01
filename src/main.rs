@@ -199,22 +199,31 @@ fn review_status_to_stars(status: Option<&str>) -> u8 {
     }
 }
 
+
 /// Custom error to unify reading different VCFs (ClinVar or 1000G)
-#[derive(Debug)]
 enum VcfReadError {
-    Io(()),
-    Parse(()),
+    Io(std::io::Error),
+    Parse(std::num::ParseIntError),
 }
 
 impl From<std::io::Error> for VcfReadError {
     fn from(e: std::io::Error) -> Self {
-        VcfReadError::Io(())
+        VcfReadError::Io(e)
     }
 }
 
 impl From<std::num::ParseIntError> for VcfReadError {
     fn from(e: std::num::ParseIntError) -> Self {
-        VcfReadError::Parse(())
+        VcfReadError::Parse(e)
+    }
+}
+
+impl fmt::Display for VcfReadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            VcfReadError::Io(e) => write!(f, "IO error during VCF read: {}", e),
+            VcfReadError::Parse(e) => write!(f, "Parse error during VCF read: {}", e),
+        }
     }
 }
 
