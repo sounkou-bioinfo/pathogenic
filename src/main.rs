@@ -208,12 +208,13 @@ enum VcfReadError {
 
 impl From<std::io::Error> for VcfReadError {
     fn from(e: std::io::Error) -> Self {
-        VcfReadError::Io(e)
+        VcfReadError::Io(())
     }
 }
+
 impl From<std::num::ParseIntError> for VcfReadError {
     fn from(e: std::num::ParseIntError) -> Self {
-        VcfReadError::Parse(e)
+        VcfReadError::Parse(())
     }
 }
 
