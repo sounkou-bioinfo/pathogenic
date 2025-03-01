@@ -5,7 +5,6 @@ use flate2::read::MultiGzDecoder;
 use indicatif::{ProgressBar, ProgressStyle};
 use num_cpus;
 use rayon::prelude::*;
-use reqwest::blocking;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
@@ -32,9 +31,10 @@ struct Args {
 /// Custom error type for downloads
 #[derive(Debug)]
 enum DownloadError {
-    Io(()),
+    Io(std::io::Error),
     Reqwest(reqwest::Error),
 }
+
 impl fmt::Display for DownloadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -71,10 +71,7 @@ fn download_file(
     println!("  -> Starting download from {url}");
     writeln!(log_file, "  -> Starting download from {url}")?;
 
-    // Create a blocking client.
     let client = reqwest::blocking::Client::new();
-
-    // Perform a HEAD request to get the file size and check for range support.
     let head_resp = client.head(url).send()?;
     let total_size = head_resp
         .headers()
@@ -88,14 +85,13 @@ fn download_file(
         .and_then(|s| s.to_str().ok())
         .unwrap_or("");
 
-    // If total size is unknown or the server does not support ranges, fall back to single-threaded download.
     if total_size == 0 || accept_ranges != "bytes" {
-        println!("  -> Server does not support parallel downloads. Falling back to single-threaded download.");
-        writeln!(log_file, "  -> Server does not support parallel downloads. Falling back to single-threaded download.")?;
+        println!("  -> Server does not support parallel downloads; falling back to single-threaded download.");
+        writeln!(log_file, "  -> Server does not support parallel downloads; falling back to single-threaded download.")?;
         let mut response = client.get(url).send()?;
         let pb = ProgressBar::new(total_size);
         pb.set_style(
-            indicatif::ProgressStyle::default_bar()
+            ProgressStyle::default_bar()
                 .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
                 .unwrap()
                 .progress_chars("=>-"),
@@ -114,21 +110,15 @@ fn download_file(
         return Ok(());
     }
 
-    // Use parallel downloads: split file into chunks.
     let num_chunks = num_cpus::get();
     let chunk_size = total_size / num_chunks as u64;
     let mut ranges = Vec::new();
     for i in 0..num_chunks {
         let start = i as u64 * chunk_size;
-        let end = if i == num_chunks - 1 {
-            total_size - 1
-        } else {
-            (i as u64 + 1) * chunk_size - 1
-        };
+        let end = if i == num_chunks - 1 { total_size - 1 } else { (i as u64 + 1) * chunk_size - 1 };
         ranges.push((start, end));
     }
 
-    // Shared atomic counter for progress.
     let progress = Arc::new(AtomicU64::new(0));
     let mut handles = Vec::new();
 
@@ -154,7 +144,6 @@ fn download_file(
         handles.push(handle);
     }
 
-    // Set up a progress bar that is updated by the atomic counter.
     let pb = ProgressBar::new(total_size);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -169,17 +158,14 @@ fn download_file(
     }
     pb.finish_with_message("Download complete");
 
-    // Collect results from all threads.
     let mut chunks: Vec<(usize, Vec<u8>)> = Vec::with_capacity(handles.len());
     for handle in handles {
-        chunks.push(handle.join().map_err(|_| DownloadError::Io(
-            std::io::Error::new(std::io::ErrorKind::Other, "Thread join error")
-        ))?);
+        let res = handle.join().map_err(|_| {
+            DownloadError::Io(std::io::Error::new(std::io::ErrorKind::Other, "Thread join error"))
+        })??;
+        chunks.push(res);
     }
-    // Sort chunks by their index.
-    chunks.sort_by_key(|(idx, _)| *idx);
-
-    // Write the combined data to the output file.
+    chunks.sort_by_key(|(i, _)| *i);
     let mut file = File::create(out_path)?;
     for (_i, data) in chunks {
         file.write_all(&data)?;
@@ -216,9 +202,10 @@ fn review_status_to_stars(status: Option<&str>) -> u8 {
 /// Custom error to unify reading different VCFs (ClinVar or 1000G)
 #[derive(Debug)]
 enum VcfReadError {
-    Io(()),
-    Parse(()),
+    Io(std::io::Error),
+    Parse(std::num::ParseIntError),
 }
+
 impl From<std::io::Error> for VcfReadError {
     fn from(e: std::io::Error) -> Self {
         VcfReadError::Io(e)
@@ -414,9 +401,6 @@ struct OneKgRecord {
     sas: Option<f64>,
 }
 
-/// Container for 1000 Genomes frequency keyed by (chr, pos, ref, alt)
-type OneKgMap = HashMap<(String, u32, String, String), OneKgRecord>;
-
 /// Parse a single line from the 1000 Genomes VCF
 fn parse_onekg_line(line: &str) -> Option<Vec<OneKgRecord>> {
     if line.starts_with('#') || line.trim().is_empty() {
@@ -489,70 +473,6 @@ fn parse_onekg_line(line: &str) -> Option<Vec<OneKgRecord>> {
         });
     }
     Some(recs)
-}
-
-/// Parse the 1000 Genomes VCF in parallel
-fn parse_onekg_vcf_gz(
-    path_gz: &Path,
-    log_file: &mut File,
-) -> Result<OneKgMap, Box<dyn Error>> {
-    println!("[STEP] Parsing 1000 Genomes frequency VCF: {}", path_gz.display());
-    writeln!(
-        log_file,
-        "[STEP] Parsing 1000 Genomes frequency VCF: {}",
-        path_gz.display()
-    )?;
-
-    let file = File::open(path_gz)?;
-    let decoder = MultiGzDecoder::new(file);
-    let reader = BufReader::new(decoder);
-
-    let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
-    let total = lines.len() as u64;
-
-    println!("  -> Streaming 1000 Genomes VCF, total lines: {}", total);
-    writeln!(
-        log_file,
-        "  -> Streaming 1000 Genomes VCF, total lines: {}",
-        total
-    )?;
-
-    let pb = ProgressBar::new(total);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} ({eta})")
-            .unwrap()
-            .progress_chars("=>-"),
-    );
-
-    let chunk_maps: Vec<OneKgMap> = lines
-        .par_iter()
-        .map(|line| {
-            pb.inc(1);
-            match parse_onekg_line(line) {
-                None => HashMap::new(),
-                Some(records) => {
-                    let mut local_map = HashMap::with_capacity(records.len());
-                    for r in records {
-                        let key = (r.chr.clone(), r.pos, r.ref_allele.clone(), r.alt_allele.clone());
-                        local_map.insert(key, r);
-                    }
-                    local_map
-                }
-            }
-        })
-        .collect();
-
-    pb.finish_with_message("1000 Genomes parse complete.");
-
-    let mut final_map = HashMap::new();
-    for cm in chunk_maps {
-        final_map.extend(cm);
-    }
-
-    println!("  -> Final 1000 Genomes map size: {}", final_map.len());
-    writeln!(log_file, "  -> Final 1000 Genomes map size: {}", final_map.len())?;
-    Ok(final_map)
 }
 
 /// A specialized type for user input variants
@@ -1081,9 +1001,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("[LOG] ClinVar date: {}", clinvar_file_date);
     writeln!(log_file, "[LOG] ClinVar date: {}", clinvar_file_date)?;
 
-    // Parse the 1000 Genomes VCF
-    let onekg_map = parse_onekg_vcf_gz(&onekg_file_path, &mut log_file)?;
-
     // Parse the ClinVar TSV for deeper annotation
     let tsv_map = parse_clinvar_tsv(&tsv_path, &build, &mut log_file)?;
 
@@ -1124,7 +1041,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .progress_chars("=>-"),
     );
 
-    let mut temp_results: Vec<TempRecord> = input_variants
+    let temp_results: Vec<TempRecord> = input_variants
         .par_iter()
         .flat_map_iter(|(_, iv)| {
             let mut local_found = Vec::new();
@@ -1165,6 +1082,43 @@ fn main() -> Result<(), Box<dyn Error>> {
     pb.finish_with_message("ClinVar matching complete.");
 
     println!("  -> Matched {} variants in ClinVar", temp_results.len());
+    // Collect keys of interest from temp_results for 1000 Genomes frequency lookup
+    let keys_of_interest: HashSet<(String, u32, String, String)> = temp_results
+        .iter()
+        .map(|r| (r.chr.clone(), r.pos, r.ref_allele.clone(), r.alt_allele.clone()))
+        .collect();
+
+    // Stream 1000 Genomes VCF and extract frequencies for keys_of_interest
+    println!("[STEP] Streaming 1000 Genomes frequency VCF: {}", onekg_file_path.display());
+    writeln!(log_file, "[STEP] Streaming 1000 Genomes frequency VCF: {}", onekg_file_path.display())?;
+    let file = File::open(&onekg_file_path)?;
+    let decoder = MultiGzDecoder::new(file);
+    let reader = BufReader::new(decoder);
+    let total_lines = 82_663_614; // Approximate total lines for progress bar
+    let pb = ProgressBar::new(total_lines as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} ({eta})")?
+            .progress_chars("=>-"),
+    );
+
+    let mut onekg_freqs: HashMap<(String, u32, String, String), OneKgRecord> = HashMap::with_capacity(keys_of_interest.len());
+    for line in reader.lines() {
+        let line = line?;
+        pb.inc(1);
+        if let Some(records) = parse_onekg_line(&line) {
+            for rec in records {
+                let key = (rec.chr.clone(), rec.pos, rec.ref_allele.clone(), rec.alt_allele.clone());
+                if keys_of_interest.contains(&key) {
+                    onekg_freqs.insert(key, rec);
+                }
+            }
+        }
+    }
+    pb.finish_with_message("1000 Genomes streaming complete.");
+    println!("  -> Extracted frequencies for {} variants", onekg_freqs.len());
+    writeln!(log_file, "  -> Extracted frequencies for {} variants", onekg_freqs.len())?;
+    
     writeln!(
         log_file,
         "  -> Matched {} variants in ClinVar",
@@ -1173,54 +1127,41 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Next, we combine with 1000G frequency data
     let mut final_records: Vec<FinalRecord> = Vec::new();
-    for r in temp_results.drain(..) {
+    for r in &temp_results {
         let key = (r.chr.clone(), r.pos, r.ref_allele.clone(), r.alt_allele.clone());
-        let onekg_rec = onekg_map.get(&key);
+        let onekg_rec = onekg_freqs.get(&key);
         let (af_afr, af_amr, af_eas, af_eur, af_sas) = match onekg_rec {
             None => (None, None, None, None, None),
             Some(ok) => (
                 ok.afr, ok.amr, ok.eas, ok.eur, ok.sas
             ),
         };
-
-        // We'll also incorporate the TSV annotation at this time
         let annotation = tsv_map.get(&key);
-
         let final_rec = FinalRecord {
-            chr: r.chr,
+            chr: r.chr.clone(),
             pos: r.pos,
-            ref_allele: r.ref_allele,
-            alt_allele: r.alt_allele,
-            clnsig: r.clnsig,
+            ref_allele: r.ref_allele.clone(),
+            alt_allele: r.alt_allele.clone(),
+            clnsig: r.clnsig.clone(),
             is_alt_pathogenic: r.is_alt_pathogenic,
-            gene: r.gene,
+            gene: r.gene.clone(),
             allele_id: r.allele_id,
-            genotype: r.genotype,
+            genotype: r.genotype.clone(),
             review_stars: r.review_stars,
             af_esp: r.af_esp,
             af_exac: r.af_exac,
             af_tgp: r.af_tgp,
-            clndn: r.clndn,
-            molecular_consequence: annotation
-                .and_then(|ann| ann.molecular_consequence.clone()),
-            functional_consequence: annotation
-                .and_then(|ann| ann.functional_consequence.clone()),
-            mode_of_inheritance: annotation
-                .and_then(|ann| ann.mode_of_inheritance.clone()),
-            preferred_values: annotation
-                .and_then(|ann| ann.preferred_values.clone()),
-            citations: annotation
-                .and_then(|ann| ann.citations.clone()),
-            comments: annotation
-                .and_then(|ann| ann.comments.clone()),
-            family_data: annotation
-                .and_then(|ann| ann.family_data.clone()),
-            record_status: annotation
-                .and_then(|ann| ann.record_status.clone()),
-            description: annotation
-                .and_then(|ann| ann.description.clone()),
-            date_last_evaluated: annotation
-                .and_then(|ann| ann.date_last_evaluated.clone()),
+            clndn: r.clndn.clone(),
+            molecular_consequence: annotation.and_then(|ann| ann.molecular_consequence.clone()),
+            functional_consequence: annotation.and_then(|ann| ann.functional_consequence.clone()),
+            mode_of_inheritance: annotation.and_then(|ann| ann.mode_of_inheritance.clone()),
+            preferred_values: annotation.and_then(|ann| ann.preferred_values.clone()),
+            citations: annotation.and_then(|ann| ann.citations.clone()),
+            comments: annotation.and_then(|ann| ann.comments.clone()),
+            family_data: annotation.and_then(|ann| ann.family_data.clone()),
+            record_status: annotation.and_then(|ann| ann.record_status.clone()),
+            description: annotation.and_then(|ann| ann.description.clone()),
+            date_last_evaluated: annotation.and_then(|ann| ann.date_last_evaluated.clone()),
             af_afr,
             af_amr,
             af_eas,
