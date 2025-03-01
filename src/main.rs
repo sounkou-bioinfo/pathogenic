@@ -145,8 +145,6 @@ fn review_status_to_stars(status: Option<&str>) -> u8 {
 /// Parse a ClinVar VCF line into zero or more ClinVarRecords
 fn parse_clinvar_line(
     line: &str,
-    clinvar_has_chr: bool,
-    input_uses_chr: bool,
 ) -> Option<Vec<ClinVarRecord>> {
     if line.starts_with('#') || line.trim().is_empty() {
         return None;
@@ -163,23 +161,13 @@ fn parse_clinvar_line(
     let info_str = fields.next()?;
     let pos_num: u32 = pos_str.parse().ok()?;
 
-    let mut chr_fixed = chrom;
-    if input_uses_chr && !clinvar_has_chr {
-        chr_fixed = if chr_fixed == "MT" {
-            "chrM".to_string()
-        } else {
-            format!("chr{}", chr_fixed)
-        };
-    } else if !input_uses_chr && clinvar_has_chr {
-        chr_fixed =
-            if chr_fixed.eq_ignore_ascii_case("chrM") || chr_fixed.eq_ignore_ascii_case("chrMT") {
-                "MT".to_string()
-            } else if let Some(stripped) = chr_fixed.strip_prefix("chr") {
-                stripped.to_string()
-            } else {
-                chr_fixed
-            };
-    }
+    let chr_norm = if chrom.eq_ignore_ascii_case("chrM") || chrom.eq_ignore_ascii_case("chrMT") {
+        "MT".to_string()
+    } else if let Some(stripped) = chrom.strip_prefix("chr") {
+        stripped.to_string()
+    } else {
+        chrom.clone()
+    };
 
     let alt_list: Vec<&str> = alt_allele.split(',').collect();
     let info_map = parse_info_field(info_str);
@@ -214,7 +202,7 @@ fn parse_clinvar_line(
     let mut recs = Vec::with_capacity(alt_list.len());
     for alt_a in alt_list {
         recs.push(ClinVarRecord {
-            chr: chr_fixed.clone(),
+            chr: chr_norm.clone(),
             pos: pos_num,
             ref_allele: ref_allele.to_string(),
             alt_allele: alt_a.to_string(),
@@ -234,7 +222,6 @@ fn parse_clinvar_line(
 /// Parse the ClinVar .vcf.gz file in parallel
 fn parse_clinvar_vcf_gz(
     path_gz: &Path,
-    input_uses_chr: bool,
     log_file: &mut File,
 ) -> Result<(ClinVarMap, String), Box<dyn Error>> {
     println!("\n[STEP] Parsing ClinVar .vcf.gz: {}", path_gz.display());
@@ -294,7 +281,7 @@ fn parse_clinvar_vcf_gz(
         .par_iter()
         .map(|line| {
             pb.inc(1);
-            match parse_clinvar_line(line, clinvar_has_chr, input_uses_chr) {
+            match parse_clinvar_line(line) {
                 None => HashMap::new(),
                 Some(records) => {
                     let mut local_map = HashMap::with_capacity(records.len());
@@ -548,23 +535,13 @@ fn parse_input_line(
     }
 
     let pos_num: u32 = pos_str.parse().ok()?;
-    let mut chr_fixed = chrom;
-    if need_chr && !user_has_chr {
-        chr_fixed = if chr_fixed == "MT" {
-            "chrM".to_string()
-        } else {
-            format!("chr{}", chr_fixed)
-        };
-    } else if !need_chr && user_has_chr {
-        chr_fixed =
-            if chr_fixed.eq_ignore_ascii_case("chrM") || chr_fixed.eq_ignore_ascii_case("chrMT") {
-                "MT".to_string()
-            } else if let Some(stripped) = chr_fixed.strip_prefix("chr") {
-                stripped.to_string()
-            } else {
-                chr_fixed
-            };
-    }
+    let chr_fixed = if chrom.eq_ignore_ascii_case("chrM") || chrom.eq_ignore_ascii_case("chrMT") {
+        "MT".to_string()
+    } else if let Some(stripped) = chrom.strip_prefix("chr") {
+        stripped.to_string()
+    } else {
+        chrom.to_string()
+    };
 
     let alt_list: Vec<String> = alt_allele.split(',').map(|s| s.to_string()).collect();
     let mut present_flags = HashSet::new();
@@ -624,7 +601,6 @@ fn parse_input_line(
 /// Parse the user input VCF (uncompressed)
 fn parse_input_vcf(
     path: &Path,
-    need_chr: bool,
     log_file: &mut File,
 ) -> Result<Vec<(String, InputVariant)>, Box<dyn Error>> {
     println!(
@@ -824,11 +800,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     writeln!(log_file, "  -> user input uses chr? {}", user_has_chr)?;
 
     let (clinvar_map, clinvar_file_date) =
-        parse_clinvar_vcf_gz(&gz_path, user_has_chr, &mut log_file)?;
+        parse_clinvar_vcf_gz(&gz_path, &mut log_file)?;
     println!("[LOG] ClinVar File Date: {}", clinvar_file_date);
     writeln!(log_file, "[LOG] ClinVar File Date: {}", clinvar_file_date)?;
 
-    let input_variants = parse_input_vcf(&input_path, user_has_chr, &mut log_file)?;
+    let input_variants = parse_input_vcf(&input_path, &mut log_file)?;
 
     println!("\n[STEP] Matching input variants vs. ClinVar...");
     writeln!(log_file, "\n[STEP] Matching input variants vs. ClinVar...")?;
