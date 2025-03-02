@@ -405,10 +405,6 @@ fn parse_clinvar_vcf_gz(
 /// A specialized type for 1000 Genomes frequency
 #[derive(Debug, Clone)]
 struct OneKgRecord {
-    chr: String,
-    pos: u32,
-    ref_allele: String,
-    alt_allele: String,
     afr: Option<f64>,
     amr: Option<f64>,
     eas: Option<f64>,
@@ -476,10 +472,6 @@ fn parse_onekg_line(line: &str) -> Option<Vec<OneKgRecord>> {
     for i in 0..alt_len {
         let alt_str = alt_list[i].to_string();
         recs.push(OneKgRecord {
-            chr: chr_norm.clone(),
-            pos: pos_num,
-            ref_allele: ref_allele.to_string(),
-            alt_allele: alt_str,
             afr: afr_vals[i],
             amr: amr_vals[i],
             eas: eas_vals[i],
@@ -1169,10 +1161,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                         let sas = get_freq("SAS");
 
                         let record = OneKgRecord {
-                            chr: record_chr.clone(),
-                            pos: record_pos.get() as u32,
-                            ref_allele: record_ref.clone(),
-                            alt_allele: alt.clone(),
                             afr,
                             amr,
                             eas,
