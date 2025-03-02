@@ -11,10 +11,9 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use noodles::bgzf::Reader as BgzfReader;
+use noodles::vcf::variant::record::info::field::Value;
 use noodles::vcf::io::indexed_reader::IndexedReader;
-use noodles::vcf::record::Record;
-use noodles::noodles_vcf::variant::record::AlternateBases;
+use noodles::vcf::variant::record::AlternateBases;
 use noodles::core::region::Region;
 use noodles::csi;
 
@@ -1142,17 +1141,24 @@ fn main() -> Result<(), Box<dyn Error>> {
             while let Some(record) = query.next() {
                 let record = record?;
                 let record_chr = record.reference_sequence_name().to_string();
-                let record_pos = record.start() as u32;
+                let record_pos = record
+                    .variant_start()
+                    .expect("Failed to get variant start")?;
                 let record_ref = record.reference_bases().to_string();
-                let record_alts: Vec<String> = record.alternate_bases().iter().map(|alt| alt.to_string()).collect()?;
+                let record_alts: Vec<String> = record
+                    .alternate_bases()
+                    .iter()
+                    .filter_map(Result::ok)
+                    .map(|a| a.to_string())
+                    .collect();
                 let info = record.info();
                 for alt in record_alts {
-                    let key = (record_chr.clone(), record_pos, record_ref.clone(), alt.clone());
+                    let key = (record_chr.clone(), record_pos.get() as u32, record_ref.clone(), alt.clone());
                     if keys_of_interest.contains(&key) {
                         // Helper function to parse a frequency value from info field for a given population key
                         let get_freq = |key: &str| -> Option<f64> {
                             match info.get(&header, key) {
-                                Some(Ok(Ok(Some(values)))) => values.first().and_then(|s| s.parse::<f64>().ok()),
+                                Some(Ok(Some(Value::String(s)))) => s.as_ref().parse::<f64>().ok(),
                                 _ => None,
                             }
                         };
@@ -1164,7 +1170,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
                         let record = OneKgRecord {
                             chr: record_chr.clone(),
-                            pos: record_pos,
+                            pos: record_pos.get() as u32,
                             ref_allele: record_ref.clone(),
                             alt_allele: alt.clone(),
                             afr,
