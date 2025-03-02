@@ -13,6 +13,9 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use noodles::bgzf::Reader as BgzfReader;
 use noodles::vcf::io::indexed_reader::IndexedReader;
+use noodles::vcf::record::Record;
+use noodles::noodles_vcf::variant::record::AlternateBases;
+use noodles::core::region::Region;
 use noodles::csi;
 
 /// Command-line arguments
@@ -1124,30 +1127,41 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut csi_reader = csi::io::Reader::new(index_file);
     let index = csi_reader.read_index()?;
     let mut reader = IndexedReader::new(file, index);
+    let header = reader.read_header()?;
 
     let mut onekg_freqs: HashMap<(String, u32, String, String), OneKgRecord> = HashMap::with_capacity(keys_of_interest.len());
     let mut unique_regions: HashSet<(String, u32)> = HashSet::new();
     for (chr, pos, _ref, _alt) in keys_of_interest.iter() {
         unique_regions.insert((chr.clone(), *pos));
     }
+
     for (chr, pos) in unique_regions {
-        let region = format!("{}:{}-{}", chr, pos, pos);
-        if let Ok(mut query) = reader.query(&region) {
+        let region_str = format!("{}:{}-{}", chr, pos, pos);
+        let region_obj: Region = region_str.parse()?;
+        if let Ok(mut query) = reader.query(&header, &region_obj) {
             while let Some(record) = query.next() {
                 let record = record?;
-                let record_chr = record.chromosome().to_string();
-                let record_pos = record.position();
+                let record_chr = record.reference_sequence_name().to_string();
+                let record_pos = record.start() as u32;
                 let record_ref = record.reference_bases().to_string();
-                let record_alts: Vec<String> = record.alternate_bases().iter().map(|alt| alt.to_string()).collect();
+                let record_alts: Vec<String> = record.alternate_bases().iter().map(|alt| alt.to_string()).collect()?;
                 let info = record.info();
                 for alt in record_alts {
                     let key = (record_chr.clone(), record_pos, record_ref.clone(), alt.clone());
                     if keys_of_interest.contains(&key) {
-                        let afr = info.get("AFR").and_then(|v| v.first()).and_then(|s| s.parse::<f64>().ok());
-                        let amr = info.get("AMR").and_then(|v| v.first()).and_then(|s| s.parse::<f64>().ok());
-                        let eas = info.get("EAS").and_then(|v| v.first()).and_then(|s| s.parse::<f64>().ok());
-                        let eur = info.get("EUR").and_then(|v| v.first()).and_then(|s| s.parse::<f64>().ok());
-                        let sas = info.get("SAS").and_then(|v| v.first()).and_then(|s| s.parse::<f64>().ok());
+                        // Helper function to parse a frequency value from info field for a given population key
+                        let get_freq = |key: &str| -> Option<f64> {
+                            match info.get(&header, key) {
+                                Some(Ok(Ok(Some(values)))) => values.first().and_then(|s| s.parse::<f64>().ok()),
+                                _ => None,
+                            }
+                        };
+                        let afr = get_freq("AFR");
+                        let amr = get_freq("AMR");
+                        let eas = get_freq("EAS");
+                        let eur = get_freq("EUR");
+                        let sas = get_freq("SAS");
+
                         let record = OneKgRecord {
                             chr: record_chr.clone(),
                             pos: record_pos,
