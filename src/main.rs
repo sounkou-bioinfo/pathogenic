@@ -1064,21 +1064,33 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .map(|a| a.to_string())
                     .collect();
                 let info = record.info();
-                for alt in record_alts {
+                for (alt_idx, alt) in record_alts.iter().enumerate() {
                     let key = (record_chr.clone(), record_pos.get() as u32, record_ref.clone(), alt.clone());
                     if keys_of_interest.contains(&key) {
-                        // Helper function to parse a frequency value from info field for a given population key
-                        let get_freq = |key: &str| -> Option<f64> {
+                        // Helper function to extract the frequency for a specific alternate allele from the INFO field
+                        let get_freq = |key: &str, alt_idx: usize| -> Option<f64> {
                             match info.get(&header, key) {
-                                Some(Ok(Some(Value::String(s)))) => s.as_ref().parse::<f64>().ok(),
+                                Some(Ok(Some(Value::Array(array)))) => {
+                                    match array {
+                                        noodles::vcf::variant::record::info::field::value::Array::Float(values) => {
+                                            let mut iter = values.iter();
+                                            if let Some(Ok(Some(f))) = iter.nth(alt_idx) {
+                                                Some(f as f64)
+                                            } else {
+                                                None
+                                            }
+                                        },
+                                        _ => None, // Handle other Array variants (e.g., Integer, String)
+                                    }
+                                },
                                 _ => None,
                             }
                         };
-                        let afr = get_freq("AFR");
-                        let amr = get_freq("AMR");
-                        let eas = get_freq("EAS");
-                        let eur = get_freq("EUR");
-                        let sas = get_freq("SAS");
+                        let afr = get_freq("AFR", alt_idx);
+                        let amr = get_freq("AMR", alt_idx);
+                        let eas = get_freq("EAS", alt_idx);
+                        let eur = get_freq("EUR", alt_idx);
+                        let sas = get_freq("SAS", alt_idx);
                         onekg_freqs.insert(key, (afr, amr, eas, eur, sas));
                     }
                 }
