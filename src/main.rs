@@ -402,86 +402,6 @@ fn parse_clinvar_vcf_gz(
     Ok((final_map, file_date))
 }
 
-/// A specialized type for 1000 Genomes frequency
-#[derive(Debug, Clone)]
-struct OneKgRecord {
-    afr: Option<f64>,
-    amr: Option<f64>,
-    eas: Option<f64>,
-    eur: Option<f64>,
-    sas: Option<f64>,
-}
-
-/// Parse a single line from the 1000 Genomes VCF
-fn parse_onekg_line(line: &str) -> Option<Vec<OneKgRecord>> {
-    if line.starts_with('#') || line.trim().is_empty() {
-        return None;
-    }
-    let mut fields = line.split('\t');
-    let chrom = fields.next()?.to_string();
-    let pos_str = fields.next()?;
-    let _ = fields.next(); // ID
-    let ref_allele = fields.next()?;
-    let alt_allele = fields.next()?;
-    let _ = fields.next(); // QUAL
-    let _ = fields.next(); // FILTER
-    let info_str = fields.next()?;
-
-    let pos_num = pos_str.parse::<u32>().ok()?;
-
-    let chr_norm = if chrom.eq_ignore_ascii_case("chrM") || chrom.eq_ignore_ascii_case("chrMT") {
-        "MT".to_string()
-    } else if let Some(stripped) = chrom.strip_prefix("chr") {
-        stripped.to_string()
-    } else {
-        chrom.clone()
-    };
-
-    // alt can have multiple alleles separated by commas
-    let alt_list: Vec<&str> = alt_allele.split(',').collect();
-    let info_map = parse_info_field(info_str);
-
-    // We expect something like AFR=0.4909,0 if multiple ALT
-    // We'll parse each population's frequencies as comma-separated floats, in parallel to ALT alleles
-    fn parse_pop_freq(val: Option<&String>, alt_count: usize) -> Vec<Option<f64>> {
-        if val.is_none() {
-            return vec![None; alt_count];
-        }
-        let arr: Vec<&str> = val.unwrap().split(',').collect();
-        let mut out = Vec::with_capacity(alt_count);
-        for i in 0..alt_count {
-            if i >= arr.len() {
-                out.push(None);
-            } else {
-                let parse_res = arr[i].parse::<f64>().ok();
-                out.push(parse_res);
-            }
-        }
-        out
-    }
-
-    let alt_len = alt_list.len();
-
-    let afr_vals = parse_pop_freq(info_map.get("AFR"), alt_len);
-    let amr_vals = parse_pop_freq(info_map.get("AMR"), alt_len);
-    let eas_vals = parse_pop_freq(info_map.get("EAS"), alt_len);
-    let eur_vals = parse_pop_freq(info_map.get("EUR"), alt_len);
-    let sas_vals = parse_pop_freq(info_map.get("SAS"), alt_len);
-
-    let mut recs = Vec::with_capacity(alt_len);
-    for i in 0..alt_len {
-        let alt_str = alt_list[i].to_string();
-        recs.push(OneKgRecord {
-            afr: afr_vals[i],
-            amr: amr_vals[i],
-            eas: eas_vals[i],
-            eur: eur_vals[i],
-            sas: sas_vals[i],
-        });
-    }
-    Some(recs)
-}
-
 /// A specialized type for user input variants
 #[derive(Debug)]
 struct InputVariant {
@@ -1120,7 +1040,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut reader = IndexedReader::new(file, index);
     let header = reader.read_header()?;
 
-    let mut onekg_freqs: HashMap<(String, u32, String, String), OneKgRecord> = HashMap::with_capacity(keys_of_interest.len());
+    let mut onekg_freqs: HashMap<(String, u32, String, String), (Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>)> = HashMap::with_capacity(keys_of_interest.len());
     let mut unique_regions: HashSet<(String, u32)> = HashSet::new();
     for (chr, pos, _ref, _alt) in keys_of_interest.iter() {
         unique_regions.insert((chr.clone(), *pos));
@@ -1159,15 +1079,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         let eas = get_freq("EAS");
                         let eur = get_freq("EUR");
                         let sas = get_freq("SAS");
-
-                        let record = OneKgRecord {
-                            afr,
-                            amr,
-                            eas,
-                            eur,
-                            sas,
-                        };
-                        onekg_freqs.insert(key, record);
+                        onekg_freqs.insert(key, (afr, amr, eas, eur, sas));
                     }
                 }
             }
@@ -1186,12 +1098,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut final_records: Vec<FinalRecord> = Vec::new();
     for r in &temp_results {
         let key = (r.chr.clone(), r.pos, r.ref_allele.clone(), r.alt_allele.clone());
-        let onekg_rec = onekg_freqs.get(&key);
-        let (af_afr, af_amr, af_eas, af_eur, af_sas) = match onekg_rec {
+        let (af_afr, af_amr, af_eas, af_eur, af_sas) = match onekg_freqs.get(&key) {
             None => (None, None, None, None, None),
-            Some(ok) => (
-                ok.afr, ok.amr, ok.eas, ok.eur, ok.sas
-            ),
+            Some((afr, amr, eas, eur, sas)) => (*afr, *amr, *eas, *eur, *sas),
         };
         let annotation = tsv_map.get(&key);
         let final_rec = FinalRecord {
