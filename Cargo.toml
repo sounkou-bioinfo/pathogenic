@@ -1,5 +1,5 @@
 [package]
-name = "genetic_variant_finder"
+name = "pathogenic_variant_finder"
 version = "0.1.0"
 edition = "2021"
 

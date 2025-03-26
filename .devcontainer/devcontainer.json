@@ -1,5 +1,5 @@
 {
-  "name": "Genome Exploration Dev Container",
+  "name": "Pathogenic Variant Finder Dev Container",
   "dockerFile": "Dockerfile",
   "customizations": {
     "vscode": {
@@ -21,5 +21,5 @@
     "ghcr.io/devcontainers/features/rust:1": {},
     "ghcr.io/devcontainers/features/python:1": {}
   },
-  "postStartCommand": "apt-get update && apt-get install pkg-config libssl-dev"
+  "postStartCommand": "apt-get update && apt-get install pkg-config libssl-dev && cargo build --release && ln -sf \"${PWD}/target/release/pathogenic_variant_finder\" /usr/local/bin/pathogenic"
 }

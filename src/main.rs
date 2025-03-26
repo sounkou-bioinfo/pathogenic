@@ -850,8 +850,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         .append(true)
         .open("pathogenic.log")?;
 
-    println!("=== Genetic Variant Finder ===");
-    writeln!(log_file, "=== Genetic Variant Finder ===")?;
+    println!("=== Pathogenic Variant Finder ===");
+    writeln!(log_file, "=== Pathogenic Variant Finder ===")?;
 
     let now: DateTime<Utc> = Utc::now();
     println!("[LOG] Timestamp: {}", now.to_rfc3339());
@@ -1506,7 +1506,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let stats_path_clone = stats_path.clone();
     let mut stats_file = File::create(&stats_path)?;
     
-    writeln!(stats_file, "=== Genetic Variant Finder: Analysis Report ===")?;
+    writeln!(stats_file, "=== Pathogenic Variant Finder: Analysis Report ===")?;
     writeln!(stats_file, "Date/Time: {}", now.to_rfc3339())?;
     writeln!(stats_file, "\n=== Analysis Settings ===")?;
     writeln!(stats_file, "Input File: {}", input_path.display())?;
@@ -1572,7 +1572,21 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         // Collect the command run for inclusion in the report
         let args_vec: Vec<String> = std::env::args().collect();
-        let command_run = args_vec.join(" ");
+        
+        // Create a cleaned command for display that uses "pathogenic" as the command name
+        let mut clean_args = Vec::new();
+        
+        // Skip the binary path (first argument) and replace with "pathogenic"
+        clean_args.push("pathogenic".to_string());
+        
+        // Add all command line arguments
+        if args_vec.len() > 1 {
+            for arg in &args_vec[1..] {
+                clean_args.push(arg.clone());
+            }
+        }
+        
+        let command_run = clean_args.join(" ");
 
         // Generate the markdown report
         println!("[STEP] Generating markdown report: {}", markdown_path.display());
