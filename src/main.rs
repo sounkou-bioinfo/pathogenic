@@ -829,6 +829,21 @@ struct FinalRecord {
     clnsig_category: String,
 }
 
+/// Get the numeric order for sorting chromosomes
+fn get_chromosome_order(chr: &str) -> usize {
+    if chr == "X" { 
+        return 23; 
+    } else if chr == "Y" { 
+        return 24; 
+    } else if chr == "MT" { 
+        return 25; 
+    } else if let Ok(num) = chr.parse::<usize>() {
+        return num;
+    } else {
+        return 100; // Any other chromosome types will be sorted last
+    }
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let mut log_file = OpenOptions::new()
         .create(true)
@@ -1311,11 +1326,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Sort final records by chromosome, then by position
     final_records.sort_by(|a, b| {
-        let c = a.chr.cmp(&b.chr);
-        if c == std::cmp::Ordering::Equal {
-            a.pos.cmp(&b.pos)
-        } else {
-            c
+        let a_order = get_chromosome_order(&a.chr);
+        let b_order = get_chromosome_order(&b.chr);
+        
+        match a_order.cmp(&b_order) {
+            std::cmp::Ordering::Equal => a.pos.cmp(&b.pos),
+            other => other
         }
     });
 
@@ -1935,72 +1951,78 @@ fn write_variant_section(
     let mut variant_id = 1;
     let mut summary_entries = Vec::new();
     
-    // Sort genes alphabetically for consistent output
-    let mut sorted_genes: Vec<&String> = gene_variants.keys().collect();
-    sorted_genes.sort();
-    
-    for gene in sorted_genes {
-        let variants = &gene_variants[gene];
-        
-        // Sort variants by chromosome and position
-        let mut sorted_variants = variants.clone();
-        sorted_variants.sort_by(|a, b| {
-            a.chr.cmp(&b.chr).then_with(|| a.pos.cmp(&b.pos))
-        });
-        
-        for variant in sorted_variants {
-            let chr = &variant.chr;
-            let pos = variant.pos;
-            let ref_allele = &variant.ref_allele;
-            let alt_allele = &variant.alt_allele;
-            
-            let dna_change = format!("{} -> {}", ref_allele, alt_allele);
-            
-            // Clean condition field by replacing pipe characters with commas and underscores with spaces
-            let condition = match &variant.clndn {
-                Some(c) => c.replace('|', ", ").replace('_', " "),
-                None => "Not specified".to_string(),
-            };
-            
-            // Determine zygosity from genotype
-            let genotype = &variant.genotype;
-            let zygosity = if genotype == "1/1" {
-                "Homozygous"
-            } else if genotype == "0/1" || genotype == "1/0" {
-                "Heterozygous"
-            } else {
-                "Unknown"
-            };
-            
-            let genotype_text = format!("{}, {}", genotype, zygosity);
-            
-            // Clean clinical significance - just use the classification type without extra data
-            let clean_clnsig = variant.clnsig.replace('_', " ");
-            
-            // Format frequencies as percentages with 2 decimal places
-            let format_freq = |f: Option<f64>| -> String {
-                match f {
-                    Some(val) => format!("{:.2}%", val * 100.0),
-                    None => "N/A".to_string(),
-                }
-            };
-            
-            let afr_freq = format_freq(variant.af_afr);
-            let amr_freq = format_freq(variant.af_amr);
-            let eas_freq = format_freq(variant.af_eas);
-            let eur_freq = format_freq(variant.af_eur);
-            let sas_freq = format_freq(variant.af_sas);
-            
-            writeln!(
-                md_file,
-                "| [{}](#variant-{}) | Chr {}:{} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
-                gene, variant_id, chr, pos, dna_change, condition, genotype_text, 
-                clean_clnsig, afr_freq, amr_freq, eas_freq, eur_freq, sas_freq
-            )?;
-            
-            summary_entries.push((gene.clone(), variant, variant_id));
-            variant_id += 1;
+    // Collect all variants from all genes into a single list
+    let mut all_variants: Vec<(&String, &FinalRecord)> = Vec::new();
+    for (gene, variants) in gene_variants {
+        for variant in variants {
+            all_variants.push((gene, *variant));
         }
+    }
+    
+    // Sort all variants by chromosome and position first
+    all_variants.sort_by(|(_, a), (_, b)| {
+        let a_order = get_chromosome_order(&a.chr);
+        let b_order = get_chromosome_order(&b.chr);
+        
+        match a_order.cmp(&b_order) {
+            std::cmp::Ordering::Equal => a.pos.cmp(&b.pos),
+            other => other
+        }
+    });
+    
+    // Process the sorted variants
+    for (gene, variant) in all_variants {
+        let chr = &variant.chr;
+        let pos = variant.pos;
+        let ref_allele = &variant.ref_allele;
+        let alt_allele = &variant.alt_allele;
+        
+        let dna_change = format!("{} -> {}", ref_allele, alt_allele);
+        
+        // Clean condition field by replacing pipe characters with commas and underscores with spaces
+        let condition = match &variant.clndn {
+            Some(c) => c.replace('|', ", ").replace('_', " "),
+            None => "Not specified".to_string(),
+        };
+        
+        // Determine zygosity from genotype
+        let genotype = &variant.genotype;
+        let zygosity = if genotype == "1/1" {
+            "Homozygous"
+        } else if genotype == "0/1" || genotype == "1/0" {
+            "Heterozygous"
+        } else {
+            "Unknown"
+        };
+        
+        let genotype_text = format!("{}, {}", genotype, zygosity);
+        
+        // Clean clinical significance - just use the classification type without extra data
+        let clean_clnsig = variant.clnsig.replace('_', " ");
+        
+        // Format frequencies as percentages with 2 decimal places
+        let format_freq = |f: Option<f64>| -> String {
+            match f {
+                Some(val) => format!("{:.2}%", val * 100.0),
+                None => "N/A".to_string(),
+            }
+        };
+        
+        let afr_freq = format_freq(variant.af_afr);
+        let amr_freq = format_freq(variant.af_amr);
+        let eas_freq = format_freq(variant.af_eas);
+        let eur_freq = format_freq(variant.af_eur);
+        let sas_freq = format_freq(variant.af_sas);
+        
+        writeln!(
+            md_file,
+            "| [{}](#variant-{}) | Chr {}:{} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            gene, variant_id, chr, pos, dna_change, condition, genotype_text, 
+            clean_clnsig, afr_freq, amr_freq, eas_freq, eur_freq, sas_freq
+        )?;
+        
+        summary_entries.push((gene.clone(), variant, variant_id));
+        variant_id += 1;
     }
     
     // Detailed descriptions
