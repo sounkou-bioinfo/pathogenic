@@ -33,15 +33,15 @@ struct Args {
     input: PathBuf,
     
     /// Include variants of uncertain significance (VUS)
-    #[arg(long)]
+    #[arg(short = 'v', long, visible_alias = "vus")]
     include_vus: bool,
     
     /// Include benign variants
-    #[arg(long)]
+    #[arg(short = 'n', long, visible_alias = "benign")]
     include_benign: bool,
     
-    /// Generate markdown report (enabled by default)
-    #[arg(long, default_value = "true")]
+    /// Generate markdown report (enabled by default, use --markdown-report=false to disable)
+    #[arg(long, visible_alias = "md-report", default_value_t = true, action = clap::ArgAction::Set)]
     markdown_report: bool,
 }
 
@@ -1506,6 +1506,24 @@ fn main() -> Result<(), Box<dyn Error>> {
     let stats_path_clone = stats_path.clone();
     let mut stats_file = File::create(&stats_path)?;
     
+    // Collect the command run for inclusion in the report and statistics
+    let args_vec: Vec<String> = std::env::args().collect();
+    
+    // Create a cleaned command for display that uses "pathogenic" as the command name
+    let mut clean_args = Vec::new();
+    
+    // Skip the binary path (first argument) and replace with "pathogenic"
+    clean_args.push("pathogenic".to_string());
+    
+    // Add all command line arguments
+    if args_vec.len() > 1 {
+        for arg in &args_vec[1..] {
+            clean_args.push(arg.clone());
+        }
+    }
+    
+    let command_run = clean_args.join(" ");
+    
     writeln!(stats_file, "=== Pathogenic Variant Finder: Analysis Report ===")?;
     writeln!(stats_file, "Date/Time: {}", now.to_rfc3339())?;
     writeln!(stats_file, "\n=== Analysis Settings ===")?;
@@ -1513,6 +1531,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     writeln!(stats_file, "Genome Build: {}", build)?;
     writeln!(stats_file, "Include VUS: {}", include_vus)?;
     writeln!(stats_file, "Include Benign: {}", include_benign)?;
+    writeln!(stats_file, "Command Used: {}", command_run)?;
     
     writeln!(stats_file, "\n=== Analysis Results ===")?;
     writeln!(stats_file, "Total Variants Processed: {}", input_variants.len())?;
@@ -1569,24 +1588,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             timestamp
         );
         let markdown_path = reports_dir.join(markdown_filename);
-
-        // Collect the command run for inclusion in the report
-        let args_vec: Vec<String> = std::env::args().collect();
-        
-        // Create a cleaned command for display that uses "pathogenic" as the command name
-        let mut clean_args = Vec::new();
-        
-        // Skip the binary path (first argument) and replace with "pathogenic"
-        clean_args.push("pathogenic".to_string());
-        
-        // Add all command line arguments
-        if args_vec.len() > 1 {
-            for arg in &args_vec[1..] {
-                clean_args.push(arg.clone());
-            }
-        }
-        
-        let command_run = clean_args.join(" ");
 
         // Generate the markdown report
         println!("[STEP] Generating markdown report: {}", markdown_path.display());
@@ -1815,14 +1816,14 @@ fn generate_markdown_report(
     
     // Write analysis settings
     writeln!(md_file, "### Analysis Settings:")?;
-    writeln!(md_file, "- **Input File:** {}", input_path.display())?;
-    writeln!(md_file, "- **Genome Build:** {}", build)?;
-    writeln!(md_file, "- **Include VUS:** {}", args.include_vus)?;
-    writeln!(md_file, "- **Include Benign:** {}", args.include_benign)?;
+    writeln!(md_file, "- **Input File:** `{}`", input_path.display())?;
+    writeln!(md_file, "- **Genome Build:** `{}`", build)?;
+    writeln!(md_file, "- **Include VUS:** `{}`", args.include_vus)?;
+    writeln!(md_file, "- **Include Benign:** `{}`", args.include_benign)?;
     writeln!(md_file)?;
     
     // Write command run
-    writeln!(md_file, "**Command Run:**")?;
+    writeln!(md_file, "**Command Used:**")?;
     writeln!(md_file, "```bash")?;
     writeln!(md_file, "{}", command_run)?;
     writeln!(md_file, "```")?;
@@ -1871,7 +1872,7 @@ fn write_disclaimer_section(md_file: &mut File) -> Result<(), Box<dyn Error>> {
     writeln!(md_file, "<a id=\"disclaimer\"></a>")?;
     writeln!(md_file, "# Disclaimer")?;
     writeln!(md_file)?;
-    writeln!(md_file, "> **Important:** This report is for informational purposes only and should not be used for medical decisions without consultation with a healthcare professional. Genetic data interpretation is complex and may change over time as scientific understanding evolves.")?;
+    writeln!(md_file, "> **Important:** This report is provided for educational purposes only. Results generated or reported by the Pathogenic Variant Finder should not be used for medical diagnosis or to inform clinical decisions without proper validation by qualified healthcare professionals. The developers make no warranties, express or implied, regarding the accuracy, completeness, or reliability of the information provided by this tool. Users should be aware that variant classifications and pathogenicity assessments may change over time as new evidence emerges. Always consult with certified genetic counselors, clinical geneticists, or other appropriate healthcare providers for the interpretation of genetic variants in a medical context.")?;
     writeln!(md_file)?;
     writeln!(md_file, "---")?;
     
@@ -1958,7 +1959,7 @@ fn write_variant_section(
     // Summary table
     writeln!(md_file, "### Summary Table")?;
     writeln!(md_file)?;
-    writeln!(md_file, "| Gene | Variant Location | DNA Change | Condition | Genotype, Zygosity | Clinical Significance | African Freq | American Freq | East Asian Freq | European Freq | South Asian Freq |")?;
+    writeln!(md_file, "| Gene | Variant Location | DNA Change | Condition | Genotype, Zygosity | Clinical Significance | African Population Frequency | American Population Frequency | East Asian Population Frequency | European Population Frequency | South Asian Population Frequency |")?;
     writeln!(md_file, "|:-----|:-------|:----------|:----------|:---------|:---------|:---------------------|:---------------------|:---------------------|:---------------------|:---------------------|")?;
     
     // Track variant IDs for the details section
@@ -2227,7 +2228,7 @@ fn write_understanding_section(md_file: &mut File) -> Result<(), Box<dyn Error>>
     writeln!(md_file)?;
     writeln!(md_file, "- **Conflicting Interpretations** are variants where different labs or researchers have come to different conclusions about their significance.")?;
     writeln!(md_file)?;
-    writeln!(md_file, "- **Variants of Uncertain Significance (VUS)** are genetic changes where there is currently not enough evidence to determine if they are potentiallyharmful or harmless.")?;
+    writeln!(md_file, "- **Variants of Uncertain Significance (VUS)** are genetic changes where there is currently not enough evidence to determine if they are potentially harmful or harmless.")?;
     writeln!(md_file)?;
     writeln!(md_file, "- **Likely Benign variants** have good evidence suggesting they do not cause disease.")?;
     writeln!(md_file)?;

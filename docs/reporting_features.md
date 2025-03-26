@@ -77,6 +77,7 @@ The statistics file provides a comprehensive summary of the analysis in a readab
 - Input file path
 - Genome build used (e.g., GRCH38)
 - Which variant types were included (VUS, benign)
+- Command used to run the analysis
 - Date and time of analysis
 
 ### Analysis Results Section
@@ -158,6 +159,7 @@ Input File: /workspaces/pathogenic/data/TrevorCampbell-SQ63A788-30x-WGS-Sequenci
 Genome Build: GRCH38
 Include VUS: true
 Include Benign: true
+Command Used: pathogenic -b GRCh38 -i data/TrevorCampbell-SQ63A788-30x-WGS-Sequencing_com-02-22-25.snp-indel.genome.vcf.gz -v -n
 
 === Analysis Results ===
 Total Variants Processed: 13027212

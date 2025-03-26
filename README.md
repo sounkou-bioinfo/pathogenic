@@ -79,13 +79,13 @@ Once installed, you can use the tool simply as:
 pathogenic -b GRCh38 -i your_variants.vcf
 
 # Include Variants of Uncertain Significance (VUS)
-pathogenic -b GRCh38 -i your_variants.vcf --include-vus
+pathogenic -b GRCh38 -i your_variants.vcf -v
 
 # Include benign variants
-pathogenic -b GRCh38 -i your_variants.vcf --include-benign
+pathogenic -b GRCh38 -i your_variants.vcf -n
 
 # Include both VUS and benign variants
-pathogenic -b GRCh38 -i your_variants.vcf --include-vus --include-benign
+pathogenic -b GRCh38 -i your_variants.vcf -v -n
 
 # Disable markdown report generation
 pathogenic -b GRCh38 -i your_variants.vcf --markdown-report=false
@@ -95,9 +95,9 @@ pathogenic -b GRCh38 -i your_variants.vcf --markdown-report=false
 
 - `--build`, `-b`: Genome build, must be either "GRCh37" (hg19) or "GRCh38" (hg38)
 - `--input`, `-i`: Path to the input VCF file (can be uncompressed or gzipped)
-- `--include-vus`: Include variants of uncertain significance in the output
-- `--include-benign`: Include benign variants in the output
-- `--markdown-report`: Generate markdown report (enabled by default, use `--markdown-report=false` to disable)
+- `--include-vus`, `-v`, `--vus`: Include variants of uncertain significance in the output
+- `--include-benign`, `-n`, `--benign`: Include benign variants in the output
+- `--markdown-report`, `--md-report`: Generate markdown report (enabled by default, use `--markdown-report=false` to disable)
 
 ## Output
 
@@ -136,6 +136,7 @@ Depending on available data, many of these fields may not be available.
 A companion statistics file summarizing the analysis settings and results:
 
 - Analysis settings (input file, genome build, variant types included)
+- Command used to run the analysis
 - Total variants processed and reported
 - Number of unique genes
 - Counts of each variant classification type
