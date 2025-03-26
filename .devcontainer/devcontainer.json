@@ -23,7 +23,3 @@
   },
   "postStartCommand": "apt-get update && apt-get install pkg-config libssl-dev"
 }
-
-// Be sure to go into VS Code settings and import dotfiles from the following repo: https://github.com/trevordcampbell/dotfiles
-
-// Move the `.cursorrules` file out of the .devcontainer directory and into the root of the project for it to work
