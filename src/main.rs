@@ -39,6 +39,10 @@ struct Args {
     /// Include benign variants
     #[arg(long)]
     include_benign: bool,
+    
+    /// Generate markdown report (enabled by default)
+    #[arg(long, default_value = "true")]
+    markdown_report: bool,
 }
 
 /// Custom error type for downloads
@@ -1539,5 +1543,675 @@ fn main() -> Result<(), Box<dyn Error>> {
         stats_path_clone.display()
     )?;
 
+    // Generate markdown report if enabled
+    if args.markdown_report {
+        // Create the markdown filename
+        let markdown_filename = format!(
+            "{}_{}_{}_report.md",
+            input_filename,
+            analysis_type,
+            timestamp
+        );
+        let markdown_path = reports_dir.join(markdown_filename);
+
+        // Collect the command run for inclusion in the report
+        let args_vec: Vec<String> = std::env::args().collect();
+        let command_run = args_vec.join(" ");
+
+        // Generate the markdown report
+        println!("[STEP] Generating markdown report: {}", markdown_path.display());
+        writeln!(log_file, "[STEP] Generating markdown report: {}", markdown_path.display())?;
+
+        generate_markdown_report(
+            &final_records,
+            &markdown_path,
+            &args,
+            &category_counts,
+            &unique_genes,
+            &input_path,
+            &build,
+            input_variants.len(),
+            &timestamp.to_string(),
+            &command_run,
+            &mut log_file,
+        )?;
+
+        println!(
+            "Done. Wrote markdown report to {}",
+            markdown_path.display()
+        );
+        writeln!(
+            log_file,
+            "Done. Wrote markdown report to {}",
+            markdown_path.display()
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Generate markdown report of found variants with dynamic sections based on analysis settings
+fn generate_markdown_report(
+    final_records: &[FinalRecord],
+    out_path: &Path,
+    args: &Args,
+    category_counts: &HashMap<String, usize>,
+    unique_genes: &HashSet<String>,
+    input_path: &Path,
+    build: &str,
+    total_variants: usize,
+    _timestamp: &str,
+    command_run: &str,
+    log_file: &mut File,
+) -> Result<(), Box<dyn Error>> {
+    println!("[STEP] Generating markdown report: {}", out_path.display());
+    writeln!(log_file, "[STEP] Generating markdown report: {}", out_path.display())?;
+    
+    let mut md_file = File::create(out_path)?;
+    
+    // Current date/time for report
+    let now: DateTime<Utc> = Utc::now();
+    let datetime = now.format("%B %d, %Y @ %H:%M:%S").to_string();
+    
+    // Group variants by classification and gene for better organization
+    let mut gene_pathogenic: HashMap<String, Vec<&FinalRecord>> = HashMap::new();       // Strictly Pathogenic
+    let mut gene_likely_pathogenic: HashMap<String, Vec<&FinalRecord>> = HashMap::new(); // Likely Pathogenic
+    let mut gene_vus: HashMap<String, Vec<&FinalRecord>> = HashMap::new();              // Uncertain Significance
+    let mut gene_conflicting: HashMap<String, Vec<&FinalRecord>> = HashMap::new();      // Conflicting Interpretations
+    let mut gene_benign: HashMap<String, Vec<&FinalRecord>> = HashMap::new();           // Strictly Benign
+    let mut gene_likely_benign: HashMap<String, Vec<&FinalRecord>> = HashMap::new();    // Likely Benign
+    
+    // Track which variant types are actually present in the results
+    let mut has_pathogenic = false;
+    let mut has_likely_pathogenic = false;
+    let mut has_vus = false;
+    let mut has_conflicting = false;
+    let mut has_benign = false;
+    let mut has_likely_benign = false;
+    
+    // Organize variants by type and gene
+    for record in final_records {
+        let gene_name = record.gene.clone().unwrap_or_else(|| "Unknown".to_string());
+        let clnsig = &record.clnsig;
+        
+        if record.clnsig_category == "pathogenic" {
+            // Split pathogenic variants based on their specific clnsig value
+            if clnsig.contains("Likely_pathogenic") && !clnsig.contains("Pathogenic") {
+                has_likely_pathogenic = true;
+                gene_likely_pathogenic.entry(gene_name).or_default().push(record);
+            } else {
+                // Either strictly Pathogenic or Pathogenic/Likely_pathogenic
+                has_pathogenic = true;
+                gene_pathogenic.entry(gene_name).or_default().push(record);
+            }
+        } else if record.clnsig_category == "vus" && args.include_vus {
+            has_vus = true;
+            gene_vus.entry(gene_name).or_default().push(record);
+        } else if record.clnsig_category == "benign" && args.include_benign {
+            // Split benign variants based on their specific clnsig value
+            if clnsig.contains("Likely_benign") && !clnsig.contains("Benign") {
+                has_likely_benign = true;
+                gene_likely_benign.entry(gene_name).or_default().push(record);
+            } else {
+                // Either strictly Benign or Benign/Likely_benign
+                has_benign = true;
+                gene_benign.entry(gene_name).or_default().push(record);
+            }
+        } else if record.clnsig_category == "conflicting" && args.include_vus {
+            has_conflicting = true;
+            gene_conflicting.entry(gene_name).or_default().push(record);
+        }
+    }
+    
+    // Create a list of sections for Table of Contents and report generation
+    struct Section<'a> {
+        id: String,
+        title: String,
+        present: bool,
+        variants: HashMap<String, Vec<&'a FinalRecord>>,
+    }
+    
+    let mut sections = vec![
+        Section {
+            id: "disclaimer".to_string(),
+            title: "Disclaimer".to_string(),
+            present: true, // Always include disclaimer
+            variants: HashMap::new(),
+        },
+        Section {
+            id: "summary".to_string(),
+            title: "Summary".to_string(),
+            present: true, // Always include summary
+            variants: HashMap::new(),
+        }
+    ];
+    
+    // Add pathogenic sections if present
+    if has_pathogenic {
+        sections.push(Section {
+            id: "pathogenic-variants".to_string(),
+            title: "Pathogenic Variants".to_string(),
+            present: true,
+            variants: gene_pathogenic,
+        });
+    }
+    
+    if has_likely_pathogenic {
+        sections.push(Section {
+            id: "likely-pathogenic-variants".to_string(),
+            title: "Likely Pathogenic Variants".to_string(),
+            present: true,
+            variants: gene_likely_pathogenic,
+        });
+    }
+    
+    // Dynamically add sections based on what's included and present
+    if has_vus && args.include_vus {
+        sections.push(Section {
+            id: "uncertain-significance-variants".to_string(),
+            title: "Variants of Uncertain Significance".to_string(),
+            present: true,
+            variants: gene_vus,
+        });
+    }
+    
+    if has_conflicting && args.include_vus {
+        sections.push(Section {
+            id: "conflicting-variants".to_string(),
+            title: "Variants with Conflicting Interpretations".to_string(),
+            present: true,
+            variants: gene_conflicting,
+        });
+    }
+    
+    // Add benign sections if present and included
+    if has_benign && args.include_benign {
+        sections.push(Section {
+            id: "benign-variants".to_string(),
+            title: "Benign Variants".to_string(),
+            present: true,
+            variants: gene_benign,
+        });
+    }
+    
+    if has_likely_benign && args.include_benign {
+        sections.push(Section {
+            id: "likely-benign-variants".to_string(),
+            title: "Likely Benign Variants".to_string(),
+            present: true,
+            variants: gene_likely_benign,
+        });
+    }
+    
+    // Always add understanding section at the end
+    sections.push(Section {
+        id: "understanding-this-report".to_string(),
+        title: "Understanding This Report".to_string(),
+        present: true,
+        variants: HashMap::new(),
+    });
+    
+    // Write the header
+    writeln!(md_file, "# Genetic Variant Report")?;
+    writeln!(md_file)?;
+    writeln!(md_file, "**Date / Time Generated:** {}", datetime)?;
+    
+    // Write the variant types analyzed
+    let mut variant_types = Vec::new();
+    if has_pathogenic {
+        variant_types.push("Pathogenic");
+    }
+    if has_likely_pathogenic {
+        variant_types.push("Likely Pathogenic");
+    }
+    
+    if args.include_vus {
+        variant_types.push("Uncertain Significance");
+        variant_types.push("Conflicting Interpretations");
+    }
+    
+    if args.include_benign {
+        if has_benign {
+            variant_types.push("Benign");
+        }
+        if has_likely_benign {
+            variant_types.push("Likely Benign");
+        }
+    }
+    
+    writeln!(md_file)?;
+    writeln!(md_file, "**Variant Types Analyzed:** {}", variant_types.join(", "))?;
+    writeln!(md_file)?;
+    
+    // Write analysis settings
+    writeln!(md_file, "### Analysis Settings:")?;
+    writeln!(md_file, "- **Input File:** {}", input_path.display())?;
+    writeln!(md_file, "- **Genome Build:** {}", build)?;
+    writeln!(md_file, "- **Include VUS:** {}", args.include_vus)?;
+    writeln!(md_file, "- **Include Benign:** {}", args.include_benign)?;
+    writeln!(md_file)?;
+    
+    // Write command run
+    writeln!(md_file, "**Command Run:**")?;
+    writeln!(md_file, "```bash")?;
+    writeln!(md_file, "{}", command_run)?;
+    writeln!(md_file, "```")?;
+    
+    // Generate dynamically correct table of contents
+    writeln!(md_file)?;
+    writeln!(md_file, "---")?;
+    writeln!(md_file)?;
+    writeln!(md_file, "## Table of Contents")?;
+    writeln!(md_file)?;
+    
+    // Only include sections that are present in the results
+    let present_sections: Vec<&Section> = sections.iter()
+        .filter(|s| s.present)
+        .collect();
+    
+    for (i, section) in present_sections.iter().enumerate() {
+        writeln!(md_file, "{}. [{}](#{})", i + 1, section.title, section.id)?;
+    }
+    
+    writeln!(md_file)?;
+    writeln!(md_file, "---")?;
+    
+    // Generate each section
+    for section in sections.iter().filter(|s| s.present) {
+        if section.id == "disclaimer" {
+            write_disclaimer_section(&mut md_file)?;
+        } else if section.id == "summary" {
+            write_summary_section(&mut md_file, category_counts, args, final_records.len(), total_variants, unique_genes.len())?;
+        } else if section.id == "understanding-this-report" {
+            write_understanding_section(&mut md_file)?;
+        } else {
+            // This is a variant section - use appropriate handler
+            write_variant_section(&mut md_file, &section.variants, &section.id, &section.title)?;
+        }
+    }
+    
+    println!("  -> Markdown report generated successfully.");
+    writeln!(log_file, "  -> Markdown report generated successfully.")?;
+    
+    Ok(())
+}
+
+/// Write the disclaimer section
+fn write_disclaimer_section(md_file: &mut File) -> Result<(), Box<dyn Error>> {
+    writeln!(md_file, "<a id=\"disclaimer\"></a>")?;
+    writeln!(md_file, "# Disclaimer")?;
+    writeln!(md_file)?;
+    writeln!(md_file, "> **Important:** This report is for informational purposes only and should not be used for medical decisions without consultation with a healthcare professional. Genetic data interpretation is complex and may change over time as scientific understanding evolves.")?;
+    writeln!(md_file)?;
+    writeln!(md_file, "---")?;
+    
+    Ok(())
+}
+
+/// Write the summary section
+fn write_summary_section(
+    md_file: &mut File,
+    category_counts: &HashMap<String, usize>,
+    args: &Args,
+    variants_reported: usize,
+    variants_processed: usize,
+    unique_genes_count: usize,
+) -> Result<(), Box<dyn Error>> {
+    writeln!(md_file, "<a id=\"summary\"></a>")?;
+    writeln!(md_file, "## Summary")?;
+    writeln!(md_file)?;
+    writeln!(md_file, "This report contains genetic variants found in your genome that match clinical databases. The variants are categorized by clinical significance:")?;
+    writeln!(md_file)?;
+
+    // Additional summary stats
+    writeln!(md_file)?;
+    writeln!(md_file, "**Total Number of Genetic Variants Processed:** {}", variants_processed)?;
+    writeln!(md_file)?;
+    writeln!(md_file, "**Number of Unique Genes with Identified Variants:** {}", unique_genes_count)?;
+    writeln!(md_file)?;
+    
+    // Summary table
+    writeln!(md_file, "| Category | Count |")?;
+    writeln!(md_file, "|---------|-------|")?;
+    
+    let pathogenic_count = category_counts.get("pathogenic").unwrap_or(&0);
+    let likely_pathogenic_count = category_counts.get("likely_pathogenic").unwrap_or(&0);
+    let conflicting_count = category_counts.get("conflicting").unwrap_or(&0);
+    let vus_count = category_counts.get("vus").unwrap_or(&0);
+    let likely_benign_count = category_counts.get("likely_benign").unwrap_or(&0);
+    let benign_count = category_counts.get("benign").unwrap_or(&0);
+    
+    writeln!(md_file, "| Pathogenic | {} |", pathogenic_count)?;
+    writeln!(md_file, "| Likely Pathogenic | {} |", likely_pathogenic_count)?;
+    
+    if args.include_vus {
+        writeln!(md_file, "| Conflicting | {} |", conflicting_count)?;
+        writeln!(md_file, "| Uncertain Significance | {} |", vus_count)?;
+    } else {
+        writeln!(md_file, "| Conflicting | Not Analyzed |")?;
+        writeln!(md_file, "| Uncertain Significance | Not Analyzed |")?;
+    }
+    
+    if args.include_benign {
+        writeln!(md_file, "| Likely Benign | {} |", likely_benign_count)?;
+        writeln!(md_file, "| Benign | {} |", benign_count)?;
+    } else {
+        writeln!(md_file, "| Likely Benign | Not Analyzed |")?;
+        writeln!(md_file, "| Benign | Not Analyzed |")?;
+    }
+    
+    writeln!(md_file, "| **Total Variants Reported** | **{}** |", variants_reported)?;
+    writeln!(md_file)?;
+    writeln!(md_file, "---")?;
+    
+    Ok(())
+}
+
+/// Write the variant section (pathogenic, VUS, conflicting, or benign)
+fn write_variant_section(
+    md_file: &mut File,
+    gene_variants: &HashMap<String, Vec<&FinalRecord>>,
+    section_id: &str,
+    section_title: &str,
+) -> Result<(), Box<dyn Error>> {
+    writeln!(md_file, "<a id=\"{}\"></a>", section_id)?;
+    writeln!(md_file, "## {}", section_title)?;
+    writeln!(md_file)?;
+    
+    if gene_variants.is_empty() {
+        writeln!(md_file, "No {} were found in this analysis.", section_title.to_lowercase())?;
+        writeln!(md_file)?;
+        writeln!(md_file, "---")?;
+        return Ok(());
+    }
+    
+    // Summary table
+    writeln!(md_file, "### Summary Table")?;
+    writeln!(md_file)?;
+    writeln!(md_file, "| Gene | Variant Location | DNA Change | Condition | Genotype, Zygosity | Clinical Significance | African Freq | American Freq | East Asian Freq | European Freq | South Asian Freq |")?;
+    writeln!(md_file, "|:-----|:-------|:----------|:----------|:---------|:---------|:---------------------|:---------------------|:---------------------|:---------------------|:---------------------|")?;
+    
+    // Track variant IDs for the details section
+    let mut variant_id = 1;
+    let mut summary_entries = Vec::new();
+    
+    // Sort genes alphabetically for consistent output
+    let mut sorted_genes: Vec<&String> = gene_variants.keys().collect();
+    sorted_genes.sort();
+    
+    for gene in sorted_genes {
+        let variants = &gene_variants[gene];
+        
+        // Sort variants by chromosome and position
+        let mut sorted_variants = variants.clone();
+        sorted_variants.sort_by(|a, b| {
+            a.chr.cmp(&b.chr).then_with(|| a.pos.cmp(&b.pos))
+        });
+        
+        for variant in sorted_variants {
+            let chr = &variant.chr;
+            let pos = variant.pos;
+            let ref_allele = &variant.ref_allele;
+            let alt_allele = &variant.alt_allele;
+            
+            let dna_change = format!("{} -> {}", ref_allele, alt_allele);
+            
+            // Clean condition field by replacing pipe characters with commas and underscores with spaces
+            let condition = match &variant.clndn {
+                Some(c) => c.replace('|', ", ").replace('_', " "),
+                None => "Not specified".to_string(),
+            };
+            
+            // Determine zygosity from genotype
+            let genotype = &variant.genotype;
+            let zygosity = if genotype == "1/1" {
+                "Homozygous"
+            } else if genotype == "0/1" || genotype == "1/0" {
+                "Heterozygous"
+            } else {
+                "Unknown"
+            };
+            
+            let genotype_text = format!("{}, {}", genotype, zygosity);
+            
+            // Clean clinical significance - just use the classification type without extra data
+            let clean_clnsig = variant.clnsig.replace('_', " ");
+            
+            // Format frequencies as percentages with 2 decimal places
+            let format_freq = |f: Option<f64>| -> String {
+                match f {
+                    Some(val) => format!("{:.2}%", val * 100.0),
+                    None => "N/A".to_string(),
+                }
+            };
+            
+            let afr_freq = format_freq(variant.af_afr);
+            let amr_freq = format_freq(variant.af_amr);
+            let eas_freq = format_freq(variant.af_eas);
+            let eur_freq = format_freq(variant.af_eur);
+            let sas_freq = format_freq(variant.af_sas);
+            
+            writeln!(
+                md_file,
+                "| [{}](#variant-{}) | Chr {}:{} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                gene, variant_id, chr, pos, dna_change, condition, genotype_text, 
+                clean_clnsig, afr_freq, amr_freq, eas_freq, eur_freq, sas_freq
+            )?;
+            
+            summary_entries.push((gene.clone(), variant, variant_id));
+            variant_id += 1;
+        }
+    }
+    
+    // Detailed descriptions
+    writeln!(md_file)?;
+    writeln!(md_file, "### Detailed Descriptions")?;
+    writeln!(md_file)?;
+    
+    for (gene, variant, id) in summary_entries {
+        write_variant_details(md_file, &gene, variant, id)?;
+        writeln!(md_file)?;
+        writeln!(md_file, "---")?;
+        writeln!(md_file)?;
+    }
+    
+    Ok(())
+}
+
+/// Write details for a single variant
+fn write_variant_details(
+    md_file: &mut File,
+    gene: &str,
+    variant: &FinalRecord,
+    variant_id: usize,
+) -> Result<(), Box<dyn Error>> {
+    writeln!(md_file, "<a id=\"variant-{}\"></a>", variant_id)?;
+    writeln!(md_file, "### {}. {} ", variant_id, gene)?;
+    writeln!(md_file)?;
+    writeln!(md_file, "<details open>")?;
+    writeln!(md_file, "<summary><strong>Variant Details</strong></summary>")?;
+    writeln!(md_file)?;
+    
+    // Clean condition field by replacing pipe characters with commas and underscores with spaces
+    let condition = match &variant.clndn {
+        Some(c) => c.replace('|', ", ").replace('_', " "),
+        None => "Not specified".to_string(),
+    };
+    
+    writeln!(md_file, "**Associated Condition:** {}", condition)?;
+    writeln!(md_file)?;
+    
+    // Location
+    writeln!(md_file, "**Location:** Chromosome {}, Position {}", variant.chr, variant.pos)?;
+    writeln!(md_file)?;
+    
+    // DNA Change
+    writeln!(
+        md_file,
+        "**DNA Change:** Your DNA has `{}` where the reference genome has `{}`",
+        variant.alt_allele, variant.ref_allele
+    )?;
+    writeln!(md_file)?;
+    
+    // Genotype / Zygosity
+    let zygosity = if variant.genotype == "1/1" {
+        "Homozygous (both copies of the gene have this variant)"
+    } else if variant.genotype == "0/1" || variant.genotype == "1/0" {
+        "Heterozygous (one copy of the gene has this variant)"
+    } else {
+        ""
+    };
+    
+    writeln!(
+        md_file,
+        "**Genotype / Zygosity:** {}, {}",
+        variant.genotype, zygosity
+    )?;
+    writeln!(md_file)?;
+    
+    // Clinical significance - replace underscores with spaces
+    let clean_clnsig = variant.clnsig.replace('_', " ");
+    writeln!(md_file, "**Clinical Significance of Variant:** {}", clean_clnsig)?;
+    writeln!(md_file)?;
+    
+    // Molecular effects (if available)
+    if let Some(mol_effect) = &variant.molecular_consequence {
+        if !mol_effect.is_empty() {
+            writeln!(md_file, "**Molecular Effects:**")?;
+            writeln!(md_file, "- Type: {}", mol_effect.replace('_', " "))?;
+            writeln!(md_file)?;
+        }
+    }
+    
+    // Population frequencies
+    let has_any_freq = variant.af_afr.is_some() || variant.af_amr.is_some() || 
+                       variant.af_eas.is_some() || variant.af_eur.is_some() ||
+                       variant.af_sas.is_some();
+    
+    if has_any_freq {
+        writeln!(md_file, "**Population Frequencies:** (How common this variant is in different populations)")?;
+        writeln!(md_file, "| Population | Frequency |")?;
+        writeln!(md_file, "|:-----------|:----------|")?;
+        
+        // Format frequency helper
+        let format_freq = |f: Option<f64>| -> String {
+            match f {
+                Some(val) => format!("{:.2}%", val * 100.0),
+                None => "Not available".to_string(),
+            }
+        };
+        
+        if variant.af_afr.is_some() {
+            writeln!(md_file, "| African | {} |", format_freq(variant.af_afr))?;
+        }
+        if variant.af_amr.is_some() {
+            writeln!(md_file, "| American | {} |", format_freq(variant.af_amr))?;
+        }
+        if variant.af_eas.is_some() {
+            writeln!(md_file, "| East Asian | {} |", format_freq(variant.af_eas))?;
+        }
+        if variant.af_eur.is_some() {
+            writeln!(md_file, "| European | {} |", format_freq(variant.af_eur))?;
+        }
+        if variant.af_sas.is_some() {
+            writeln!(md_file, "| South Asian | {} |", format_freq(variant.af_sas))?;
+        }
+        writeln!(md_file)?;
+    }
+    
+    // Review status
+    let stars = variant.review_stars;
+    let review_status = if stars == 0 {
+        " - No assertion criteria provided"
+    } else if stars == 1 {
+        " ★ - Criteria provided, single submitter"
+    } else if stars == 2 {
+        " ★★ - Criteria provided, multiple submitters, no conflicts"
+    } else if stars == 3 {
+        " ★★★ - Criteria provided, reviewed by expert panel"
+    } else {
+        " ★★★★ - Practice guideline"
+    };
+    
+    writeln!(md_file, "> **Review Status:** {}", review_status)?;
+    writeln!(md_file)?;
+    
+    // Additional fields if available
+    if let Some(preferred) = &variant.preferred_values {
+        if !preferred.is_empty() {
+            writeln!(md_file, "> **Preferred Values:** {}", preferred.replace('_', " "))?;
+            writeln!(md_file)?;
+        }
+    }
+    
+    if let Some(desc) = &variant.description {
+        if !desc.is_empty() {
+            writeln!(md_file, "> **Description:** {}", desc.replace('_', " "))?;
+            writeln!(md_file)?;
+        }
+    }
+    
+    if let Some(citations) = &variant.citations {
+        if !citations.is_empty() {
+            writeln!(md_file, "> **Research Citations:** {}", citations.replace('_', " "))?;
+            writeln!(md_file)?;
+        }
+    }
+    
+    if let Some(status) = &variant.record_status {
+        if !status.is_empty() {
+            writeln!(md_file, "> **Record Status:** {}", status.replace('_', " "))?;
+            writeln!(md_file)?;
+        }
+    }
+    
+    if let Some(evaluated) = &variant.date_last_evaluated {
+        if !evaluated.is_empty() {
+            writeln!(md_file, "> **Date Last Evaluated:** {}", evaluated.replace('_', " "))?;
+            writeln!(md_file)?;
+        }
+    }
+    
+    writeln!(md_file, "</details>")?;
+    
+    Ok(())
+}
+
+/// Write the understanding section of the markdown report
+fn write_understanding_section(md_file: &mut File) -> Result<(), Box<dyn Error>> {
+    writeln!(md_file, "<a id=\"understanding-this-report\"></a>")?;
+    writeln!(md_file, "## Understanding This Report")?;
+    writeln!(md_file)?;
+    
+    writeln!(md_file, "**Clinical Significance Categories:**")?;
+    writeln!(md_file)?;
+    writeln!(md_file, "- **Pathogenic variants** are genetic changes that have strong evidence for causing disease or health conditions.")?;
+    writeln!(md_file)?;
+    writeln!(md_file, "- **Likely Pathogenic variants** have good but not definitive evidence suggesting they cause disease.")?;
+    writeln!(md_file)?;
+    writeln!(md_file, "- **Conflicting Interpretations** are variants where different labs or researchers have come to different conclusions about their significance.")?;
+    writeln!(md_file)?;
+    writeln!(md_file, "- **Variants of Uncertain Significance (VUS)** are genetic changes where there is currently not enough evidence to determine if they are potentiallyharmful or harmless.")?;
+    writeln!(md_file)?;
+    writeln!(md_file, "- **Likely Benign variants** have good evidence suggesting they do not cause disease.")?;
+    writeln!(md_file)?;
+    writeln!(md_file, "- **Benign variants** are genetic changes that are known to be harmless based on strong evidence.")?;
+    writeln!(md_file)?;
+    
+    writeln!(md_file, "**Important Note:** Having a pathogenic or likely pathogenic variant doesn't necessarily mean you will develop the condition, as other factors like environment, lifestyle, and additional genetic factors also play important roles.")?;
+    writeln!(md_file)?;
+    
+    writeln!(md_file, "**Other Terms:**")?;
+    writeln!(md_file)?;
+    writeln!(md_file, "- **Genotype / Zygosity:**")?;
+    writeln!(md_file)?;
+    writeln!(md_file, "  - **1/1, Homozygous** means the variant is present on both copies of the gene.")?;
+    writeln!(md_file)?;
+    writeln!(md_file, "  - **0/1, Heterozygous** means the variant is present on only one copy of the gene.")?;
+    writeln!(md_file)?;
+    writeln!(md_file, "- **Population Frequencies** show how common the variant is in different populations. Rare variants (low percentage) may be more significant than common ones.")?;
+    writeln!(md_file)?;
+    writeln!(md_file, "- **Review Stars** indicate the level of review in ClinVar, with more stars representing more thorough evaluation.")?;
+    
     Ok(())
 }
