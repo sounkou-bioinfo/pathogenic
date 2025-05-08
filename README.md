@@ -73,10 +73,8 @@ A Dockerfile is provided to run Pathogenic Variant Finder in a container:
 # Build the Docker image
 docker build -t pathogenic .
 # run the example, this will load 1000 Genomes and clinvar the first time
-docker run --rm -it -v $(pwd)/exdata:/data pathogenic  pathogenic-b GRCh37 -i /data/test.vcf.gz
-# Mount your data directory to /data in the container
-docker run --rm -t -v $(pwd)/exdata:/data pathogenic -b GRCh38 -i /data/test.vcf
-# The output will be saved to the reports directory in your current location
+mkdir clinvar_data # to persist the download
+docker run --rm -it -w /data -v $(pwd):/data pathogenic  pathogenic -b GRCh37 -i /data/exdata/test.vcf.gz
 ```
 
 ### Development Container Users
