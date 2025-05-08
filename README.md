@@ -66,6 +66,19 @@ cargo build --release
 sudo ln -sf "$(pwd)/target/release/pathogenic_variant_finder" /usr/local/bin/pathogenic
 ```
 
+### Option 3: using docker
+A Dockerfile is provided to run Pathogenic Variant Finder in a container:
+
+```bash
+# Build the Docker image
+docker build -t pathogenic .
+# run the example, this will load 1000 Genomes and clinvar the first time
+docker run --rm -it -v $(pwd)/exdata:/data pathogenic  pathogenic-b GRCh37 -i /data/test.vcf.gz
+# Mount your data directory to /data in the container
+docker run --rm -t -v $(pwd)/exdata:/data pathogenic -b GRCh38 -i /data/test.vcf
+# The output will be saved to the reports directory in your current location
+```
+
 ### Development Container Users
 
 If you're using the provided Dev Container, the tool will be automatically built and made available as `pathogenic` in your PATH when the container starts.
